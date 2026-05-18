@@ -38,5 +38,8 @@ target_link_libraries(
     nvinfer_plugin
     cudart
     jpeg
+    GLEW
+    GL
+    X11
     pthread
 )

@@ -21,6 +21,7 @@ Measured on an RTX 5090 with TensorRT 10.12, CUDA 12.8, and a Logitech BRIO:
 | C++ app, webcam upload + display readback | about 31-32 ms diffusion time |
 | C++ app, direct V4L2 capture, no display/readback | model 29.7 ms, loop 32.2 ms |
 | C++ app, direct V4L2 capture, FFplay display | model 31.5 ms, display write 1.0 ms, loop 33.4 ms |
+| C++ app, direct V4L2 capture, CUDA/GL display | model 29.9-30.2 ms, display 0.07-0.14 ms, loop 32.1-36.0 ms |
 
 In the webcam app, the BRIO at 1920x1080 MJPEG/30 is camera-limited around
 30 FPS. The model path itself is right at the 30 FPS boundary for 1024x1024.
@@ -44,7 +45,7 @@ single-webcam use, the live app stays on the lower-latency single-frame path.
 * scales the crop to the TensorRT engine resolution
 * uploads RGB frames to CUDA
 * runs TAESDXL encode, SDXL Turbo UNet, scheduler math, TAESDXL decode, and blend
-* displays fullscreen with FFplay
+* displays fullscreen with CUDA/OpenGL interop or FFplay
 * can skip output readback entirely in no-display mode
 * serves a browser control frontend over HTTP
 * receives OSC control messages over UDP
@@ -63,6 +64,12 @@ sudo apt-get update
 sudo apt-get install -y \
   git python3-venv python3-dev build-essential cmake ninja-build \
   ffmpeg v4l-utils pkg-config libjpeg-dev
+```
+
+For the CUDA/OpenGL display backend:
+
+```bash
+sudo ./scripts/install_display_deps.sh
 ```
 
 You also need a recent NVIDIA driver, CUDA Toolkit, and TensorRT with `trtexec`.
@@ -117,7 +124,7 @@ Fullscreen webcam app:
 ./cpp/build/transformirror_fast_app \
   --camera-device /dev/video0 \
   --capture-backend v4l2 \
-  --display-backend ffplay \
+  --display-backend gl \
   --capture-width 1920 \
   --capture-height 1080 \
   --camera-fps 30 \
@@ -130,7 +137,7 @@ Low-jitter options:
 ```bash
 ./cpp/build/transformirror_fast_app \
   --capture-backend v4l2 \
-  --display-backend ffplay \
+  --display-backend gl \
   --realtime \
   --main-core 2 \
   --capture-core 3 \
@@ -221,16 +228,16 @@ Implemented low-level latency controls:
 
 * reusable CUDA events instead of per-frame event allocation
 * no-display mode skips device-to-host output readback
+* CUDA/OpenGL display avoids device-to-host output readback in the visible path
 * direct V4L2 mmap capture for MJPEG webcams
 * explicit capture/model/display/loop timings in `/api/state`
 * optional CPU affinity and `SCHED_FIFO` thread priority
 * optional `mlockall` process memory locking
 * GPU clock lock/reset helper script
 
-The remaining planned structural display optimization is CUDA/OpenGL or
-CUDA/EGL interop. This machine has the runtime GL/X11 libraries, but not the
-development headers required to compile that backend in this repo. Until those
-headers are installed, FFplay remains the visible display path.
+The default display backend is `gl`, implemented with GLX, an OpenGL pixel
+buffer object, and CUDA graphics interop. Use `--display-backend ffplay` as a
+fallback if X11/OpenGL is unavailable.
 
 ## Resolution Notes
 
@@ -286,4 +293,5 @@ References:
 * `export_onnx_components.py` - ONNX export for VAE/UNet
 * `export_cpp_assets.py` - prompt/noise/scheduler asset export
 * `scripts/build_default_engines.sh` - default 1024x1024 build
+* `scripts/install_display_deps.sh` - Ubuntu display backend dependencies
 * `scripts/lock_gpu_clocks.sh` - optional NVIDIA clock lock/reset helper

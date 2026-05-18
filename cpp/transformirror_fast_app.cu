@@ -2,6 +2,12 @@
 #include <NvInferPlugin.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <GL/glew.h>
+#include <GL/glx.h>
+#include <cuda_gl_interop.h>
+#include <X11/Xatom.h>
+#include <X11/Xlib.h>
+#include <X11/keysym.h>
 
 #include <arpa/inet.h>
 #include <cstdio>
@@ -85,7 +91,7 @@ struct Args {
     std::string asset_dir = "cpp_assets";
     std::string camera_device = "/dev/video0";
     std::string capture_backend = "v4l2";
-    std::string display_backend = "ffplay";
+    std::string display_backend = "gl";
     std::string python = ".venv/bin/python";
     int capture_width = 1920;
     int capture_height = 1080;
@@ -223,7 +229,7 @@ Args parse_args(int argc, char** argv) {
             std::cout
                 << "Usage: transformirror_fast_app [--camera-device /dev/video0]\n"
                 << "       [--engine-dir onnx] [--asset-dir cpp_assets]\n"
-                << "       [--capture-backend v4l2|ffmpeg] [--display-backend ffplay|none]\n"
+                << "       [--capture-backend v4l2|ffmpeg] [--display-backend gl|ffplay|none]\n"
                 << "       [--http-port 8080] [--osc-port 9000] [--no-display]\n"
                 << "       [--realtime] [--lock-memory] [--rt-priority N]\n"
                 << "       [--main-core N] [--capture-core N] [--http-core N]\n";
@@ -235,8 +241,8 @@ Args parse_args(int argc, char** argv) {
     if (args.capture_backend != "v4l2" && args.capture_backend != "ffmpeg") {
         throw std::runtime_error("--capture-backend must be v4l2 or ffmpeg");
     }
-    if (args.display_backend != "ffplay" && args.display_backend != "none") {
-        throw std::runtime_error("--display-backend must be ffplay or none");
+    if (args.display_backend != "gl" && args.display_backend != "ffplay" && args.display_backend != "none") {
+        throw std::runtime_error("--display-backend must be gl, ffplay, or none");
     }
     if (args.rt_priority < 0) args.rt_priority = 0;
     if (args.rt_priority > 95) args.rt_priority = 95;
@@ -407,6 +413,7 @@ class FastPipeline {
 
     uint8_t* host_input() const { return h_src_rgb_.get(); }
     uint8_t* host_output() const { return h_dst_rgb_.get(); }
+    const uint8_t* device_output() const { return d_dst_rgb_.get(); }
     size_t rgb_bytes() const { return h_src_rgb_.bytes(); }
 
     void update_blend(float blend, bool passthrough) {
@@ -532,6 +539,203 @@ std::string ffplay_display_cmd() {
         << " -framerate 30 -i pipe:0 -fs -noborder -autoexit";
     return cmd.str();
 }
+
+class GlDisplay {
+  public:
+    explicit GlDisplay(size_t rgb_bytes) : rgb_bytes_(rgb_bytes) {
+        open_display();
+        create_window();
+        create_gl_objects();
+        register_cuda_pbo();
+        std::cerr << "display: glx cuda-pbo " << window_width_ << "x" << window_height_ << "\n";
+    }
+
+    ~GlDisplay() {
+        if (cuda_resource_) cudaGraphicsUnregisterResource(cuda_resource_);
+        if (pbo_) glDeleteBuffers(1, &pbo_);
+        if (texture_) glDeleteTextures(1, &texture_);
+        if (context_) {
+            glXMakeCurrent(display_, None, nullptr);
+            glXDestroyContext(display_, context_);
+        }
+        if (window_) XDestroyWindow(display_, window_);
+        if (colormap_) XFreeColormap(display_, colormap_);
+        if (visual_) XFree(visual_);
+        if (display_) XCloseDisplay(display_);
+    }
+
+    GlDisplay(const GlDisplay&) = delete;
+    GlDisplay& operator=(const GlDisplay&) = delete;
+
+    bool render(const uint8_t* device_rgb) {
+        pump_events();
+        if (!g_running.load()) return false;
+
+        void* mapped = nullptr;
+        size_t mapped_size = 0;
+        CHECK_CUDA(cudaGraphicsMapResources(1, &cuda_resource_, 0));
+        CHECK_CUDA(cudaGraphicsResourceGetMappedPointer(&mapped, &mapped_size, cuda_resource_));
+        if (mapped_size < rgb_bytes_) throw std::runtime_error("mapped GL PBO is smaller than RGB frame");
+        CHECK_CUDA(cudaMemcpy(mapped, device_rgb, rgb_bytes_, cudaMemcpyDeviceToDevice));
+        CHECK_CUDA(cudaGraphicsUnmapResources(1, &cuda_resource_, 0));
+
+        glViewport(0, 0, window_width_, window_height_);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glBindTexture(GL_TEXTURE_2D, texture_);
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo_);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, kWidth, kHeight, GL_RGB, GL_UNSIGNED_BYTE, nullptr);
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+
+        glEnable(GL_TEXTURE_2D);
+        glBegin(GL_TRIANGLE_STRIP);
+        glTexCoord2f(0.0f, 1.0f); glVertex2f(-1.0f, -1.0f);
+        glTexCoord2f(1.0f, 1.0f); glVertex2f(1.0f, -1.0f);
+        glTexCoord2f(0.0f, 0.0f); glVertex2f(-1.0f, 1.0f);
+        glTexCoord2f(1.0f, 0.0f); glVertex2f(1.0f, 1.0f);
+        glEnd();
+
+        glXSwapBuffers(display_, window_);
+        return true;
+    }
+
+  private:
+    using GlXSwapIntervalExtFn = void (*)(Display*, GLXDrawable, int);
+    using GlXSwapIntervalMesaFn = int (*)(unsigned int);
+    using GlXSwapIntervalSgiFn = int (*)(int);
+
+    void open_display() {
+        display_ = XOpenDisplay(nullptr);
+        if (!display_) throw std::runtime_error("failed to open X display; set DISPLAY=:0 or use --display-backend ffplay");
+        screen_ = DefaultScreen(display_);
+        window_width_ = DisplayWidth(display_, screen_);
+        window_height_ = DisplayHeight(display_, screen_);
+    }
+
+    void create_window() {
+        int attrs[] = {
+            GLX_RGBA,
+            GLX_DOUBLEBUFFER,
+            GLX_RED_SIZE, 8,
+            GLX_GREEN_SIZE, 8,
+            GLX_BLUE_SIZE, 8,
+            GLX_DEPTH_SIZE, 0,
+            None,
+        };
+        visual_ = glXChooseVisual(display_, screen_, attrs);
+        if (!visual_) throw std::runtime_error("failed to choose GLX visual");
+
+        colormap_ = XCreateColormap(display_, RootWindow(display_, screen_), visual_->visual, AllocNone);
+        XSetWindowAttributes swa{};
+        swa.colormap = colormap_;
+        swa.event_mask = ExposureMask | KeyPressMask | StructureNotifyMask;
+        window_ = XCreateWindow(
+            display_,
+            RootWindow(display_, screen_),
+            0,
+            0,
+            static_cast<unsigned int>(window_width_),
+            static_cast<unsigned int>(window_height_),
+            0,
+            visual_->depth,
+            InputOutput,
+            visual_->visual,
+            CWColormap | CWEventMask,
+            &swa);
+        if (!window_) throw std::runtime_error("failed to create X11 window");
+
+        wm_delete_ = XInternAtom(display_, "WM_DELETE_WINDOW", False);
+        XSetWMProtocols(display_, window_, &wm_delete_, 1);
+        Atom wm_state = XInternAtom(display_, "_NET_WM_STATE", False);
+        Atom fullscreen = XInternAtom(display_, "_NET_WM_STATE_FULLSCREEN", False);
+        XChangeProperty(display_, window_, wm_state, XA_ATOM, 32, PropModeReplace, reinterpret_cast<unsigned char*>(&fullscreen), 1);
+        XStoreName(display_, window_, "Transformirror Fast");
+        XMapRaised(display_, window_);
+
+        context_ = glXCreateContext(display_, visual_, nullptr, GL_TRUE);
+        if (!context_) throw std::runtime_error("failed to create GLX context");
+        if (!glXMakeCurrent(display_, window_, context_)) throw std::runtime_error("failed to make GLX context current");
+        XFlush(display_);
+    }
+
+    void create_gl_objects() {
+        glewExperimental = GL_TRUE;
+        GLenum glew_status = glewInit();
+        if (glew_status != GLEW_OK) {
+            throw std::runtime_error(std::string("GLEW init failed: ") + reinterpret_cast<const char*>(glewGetErrorString(glew_status)));
+        }
+        disable_vsync();
+
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_CULL_FACE);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+
+        glGenTextures(1, &texture_);
+        glBindTexture(GL_TEXTURE_2D, texture_);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, kWidth, kHeight, 0, GL_RGB, GL_UNSIGNED_BYTE, nullptr);
+
+        glGenBuffers(1, &pbo_);
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo_);
+        glBufferData(GL_PIXEL_UNPACK_BUFFER, rgb_bytes_, nullptr, GL_STREAM_DRAW);
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+
+        GLenum err = glGetError();
+        if (err != GL_NO_ERROR) throw std::runtime_error("OpenGL setup failed with error " + std::to_string(err));
+    }
+
+    void disable_vsync() {
+        auto* ext = reinterpret_cast<GlXSwapIntervalExtFn>(glXGetProcAddressARB(reinterpret_cast<const GLubyte*>("glXSwapIntervalEXT")));
+        if (ext) {
+            ext(display_, window_, 0);
+            return;
+        }
+        auto* mesa = reinterpret_cast<GlXSwapIntervalMesaFn>(glXGetProcAddressARB(reinterpret_cast<const GLubyte*>("glXSwapIntervalMESA")));
+        if (mesa) {
+            mesa(0);
+            return;
+        }
+        auto* sgi = reinterpret_cast<GlXSwapIntervalSgiFn>(glXGetProcAddressARB(reinterpret_cast<const GLubyte*>("glXSwapIntervalSGI")));
+        if (sgi) sgi(0);
+    }
+
+    void register_cuda_pbo() {
+        CHECK_CUDA(cudaGraphicsGLRegisterBuffer(&cuda_resource_, pbo_, cudaGraphicsRegisterFlagsWriteDiscard));
+    }
+
+    void pump_events() {
+        while (XPending(display_) > 0) {
+            XEvent event{};
+            XNextEvent(display_, &event);
+            if (event.type == ConfigureNotify) {
+                window_width_ = std::max(1, event.xconfigure.width);
+                window_height_ = std::max(1, event.xconfigure.height);
+            } else if (event.type == ClientMessage &&
+                       static_cast<Atom>(event.xclient.data.l[0]) == wm_delete_) {
+                g_running.store(false);
+            } else if (event.type == KeyPress) {
+                KeySym key = XLookupKeysym(&event.xkey, 0);
+                if (key == XK_Escape || key == XK_q) g_running.store(false);
+            }
+        }
+    }
+
+    size_t rgb_bytes_ = 0;
+    Display* display_ = nullptr;
+    int screen_ = 0;
+    int window_width_ = kWidth;
+    int window_height_ = kHeight;
+    XVisualInfo* visual_ = nullptr;
+    Colormap colormap_ = 0;
+    Window window_ = 0;
+    Atom wm_delete_ = 0;
+    GLXContext context_ = nullptr;
+    GLuint texture_ = 0;
+    GLuint pbo_ = 0;
+    cudaGraphicsResource* cuda_resource_ = nullptr;
+};
 
 bool read_exact(FILE* file, uint8_t* dst, size_t bytes) {
     size_t got = 0;
@@ -1305,11 +1509,14 @@ int main(int argc, char** argv) {
         };
 
         FILE* display = nullptr;
+        std::unique_ptr<GlDisplay> gl_display;
         if (args.display_backend == "ffplay") {
             std::string display_cmd = ffplay_display_cmd();
             std::cerr << "display: " << display_cmd << "\n";
             display = popen(display_cmd.c_str(), "w");
             if (!display) throw std::runtime_error("failed to start ffplay display");
+        } else if (args.display_backend == "gl") {
+            gl_display.reset(new GlDisplay(pipeline.rgb_bytes()));
         }
 
         int frames = 0;
@@ -1324,6 +1531,7 @@ int main(int argc, char** argv) {
             float frame_ms = pipeline.process_frame(display != nullptr);
             auto display_start = std::chrono::steady_clock::now();
             if (display && !write_exact(display, pipeline.host_output(), pipeline.rgb_bytes())) break;
+            if (gl_display && !gl_display->render(pipeline.device_output())) break;
             auto display_end = std::chrono::steady_clock::now();
             ++frames;
             ++total_frames;
