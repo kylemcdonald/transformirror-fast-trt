@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+
+cpp/build/
+onnx/
+onnx_full/
+cpp_assets/
+outputs/
+*.plan
+*.onnx
+onnx__*
+
+.cache/
+.deps/
