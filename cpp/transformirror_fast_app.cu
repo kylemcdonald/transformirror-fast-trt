@@ -4,9 +4,20 @@
 #include <cuda_runtime.h>
 
 #include <arpa/inet.h>
+#include <cstdio>
+#include <errno.h>
 #include <fcntl.h>
+#include <jpeglib.h>
+#include <linux/videodev2.h>
 #include <netinet/in.h>
+#include <poll.h>
+#include <pthread.h>
+#include <sched.h>
 #include <signal.h>
+#include <setjmp.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -17,7 +28,6 @@
 #include <condition_variable>
 #include <cmath>
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -74,6 +84,8 @@ struct Args {
     std::string engine_dir = "onnx";
     std::string asset_dir = "cpp_assets";
     std::string camera_device = "/dev/video0";
+    std::string capture_backend = "v4l2";
+    std::string display_backend = "ffplay";
     std::string python = ".venv/bin/python";
     int capture_width = 1920;
     int capture_height = 1080;
@@ -81,6 +93,13 @@ struct Args {
     int http_port = 8080;
     int osc_port = 9000;
     int max_frames = 0;
+    int main_core = -1;
+    int capture_core = -1;
+    int http_core = -1;
+    int osc_core = -1;
+    int reload_core = -1;
+    int rt_priority = 0;
+    bool lock_memory = false;
     bool no_display = false;
 };
 
@@ -96,6 +115,9 @@ struct AppState {
     int height = kHeight;
     double fps = 0.0;
     double frame_ms = 0.0;
+    double capture_ms = 0.0;
+    double display_ms = 0.0;
+    double loop_ms = 0.0;
     int queued_frames = 0;
     uint64_t dropped_frames = 0;
     std::string status = "starting";
@@ -120,6 +142,49 @@ std::string shell_quote(const std::string& value) {
     return out;
 }
 
+void warn_errno(const std::string& what) {
+    std::cerr << what << " failed: " << std::strerror(errno) << "\n";
+}
+
+void set_current_thread_name(const char* name) {
+    pthread_setname_np(pthread_self(), name);
+}
+
+void configure_current_thread(const char* name, int core, int rt_priority) {
+    set_current_thread_name(name);
+    if (core >= 0) {
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        CPU_SET(core, &cpuset);
+        int rc = pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+        if (rc != 0) {
+            std::cerr << "pin " << name << " to CPU " << core << " failed: "
+                      << std::strerror(rc) << "\n";
+        }
+    }
+    if (rt_priority > 0) {
+        sched_param param{};
+        param.sched_priority = rt_priority;
+        int rc = pthread_setschedparam(pthread_self(), SCHED_FIFO, &param);
+        if (rc != 0) {
+            std::cerr << "set SCHED_FIFO " << name << " priority " << rt_priority
+                      << " failed: " << std::strerror(rc) << "\n";
+        }
+    }
+}
+
+void try_lock_process_memory() {
+    if (mlockall(MCL_CURRENT | MCL_FUTURE) == 0) return;
+    int first_errno = errno;
+    if (mlockall(MCL_CURRENT) == 0) {
+        std::cerr << "mlockall(MCL_CURRENT|MCL_FUTURE) failed: "
+                  << std::strerror(first_errno)
+                  << "; locked current mappings only\n";
+        return;
+    }
+    warn_errno("mlockall");
+}
+
 Args parse_args(int argc, char** argv) {
     Args args;
     for (int i = 1; i < argc; ++i) {
@@ -131,6 +196,8 @@ Args parse_args(int argc, char** argv) {
         if (key == "--engine-dir") args.engine_dir = val("--engine-dir");
         else if (key == "--asset-dir") args.asset_dir = val("--asset-dir");
         else if (key == "--camera-device") args.camera_device = val("--camera-device");
+        else if (key == "--capture-backend") args.capture_backend = val("--capture-backend");
+        else if (key == "--display-backend") args.display_backend = val("--display-backend");
         else if (key == "--python") args.python = val("--python");
         else if (key == "--capture-width") args.capture_width = std::stoi(val("--capture-width"));
         else if (key == "--capture-height") args.capture_height = std::stoi(val("--capture-height"));
@@ -138,17 +205,41 @@ Args parse_args(int argc, char** argv) {
         else if (key == "--http-port") args.http_port = std::stoi(val("--http-port"));
         else if (key == "--osc-port") args.osc_port = std::stoi(val("--osc-port"));
         else if (key == "--max-frames") args.max_frames = std::stoi(val("--max-frames"));
-        else if (key == "--no-display") args.no_display = true;
+        else if (key == "--main-core") args.main_core = std::stoi(val("--main-core"));
+        else if (key == "--capture-core") args.capture_core = std::stoi(val("--capture-core"));
+        else if (key == "--http-core") args.http_core = std::stoi(val("--http-core"));
+        else if (key == "--osc-core") args.osc_core = std::stoi(val("--osc-core"));
+        else if (key == "--reload-core") args.reload_core = std::stoi(val("--reload-core"));
+        else if (key == "--rt-priority") args.rt_priority = std::stoi(val("--rt-priority"));
+        else if (key == "--lock-memory") args.lock_memory = true;
+        else if (key == "--realtime") {
+            args.lock_memory = true;
+            args.rt_priority = 10;
+        } else if (key == "--no-display") {
+            args.no_display = true;
+            args.display_backend = "none";
+        }
         else if (key == "--help" || key == "-h") {
             std::cout
                 << "Usage: transformirror_fast_app [--camera-device /dev/video0]\n"
                 << "       [--engine-dir onnx] [--asset-dir cpp_assets]\n"
-                << "       [--http-port 8080] [--osc-port 9000] [--no-display]\n";
+                << "       [--capture-backend v4l2|ffmpeg] [--display-backend ffplay|none]\n"
+                << "       [--http-port 8080] [--osc-port 9000] [--no-display]\n"
+                << "       [--realtime] [--lock-memory] [--rt-priority N]\n"
+                << "       [--main-core N] [--capture-core N] [--http-core N]\n";
             std::exit(0);
         } else {
             throw std::runtime_error("unknown argument: " + key);
         }
     }
+    if (args.capture_backend != "v4l2" && args.capture_backend != "ffmpeg") {
+        throw std::runtime_error("--capture-backend must be v4l2 or ffmpeg");
+    }
+    if (args.display_backend != "ffplay" && args.display_backend != "none") {
+        throw std::runtime_error("--display-backend must be ffplay or none");
+    }
+    if (args.rt_priority < 0) args.rt_priority = 0;
+    if (args.rt_priority > 95) args.rt_priority = 95;
     return args;
 }
 
@@ -299,6 +390,8 @@ class FastPipeline {
           d_timestep_(kTimestepElems), d_params_(kParamElems), d_blend_(1), d_passthrough_(1),
           h_src_rgb_(kRgbElems), h_dst_rgb_(kRgbElems) {
         CHECK_CUDA(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
+        CHECK_CUDA(cudaEventCreate(&start_event_));
+        CHECK_CUDA(cudaEventCreate(&end_event_));
         bind_engines();
         reload_assets();
         update_blend(1.0f, false);
@@ -306,6 +399,8 @@ class FastPipeline {
     }
 
     ~FastPipeline() {
+        if (end_event_) cudaEventDestroy(end_event_);
+        if (start_event_) cudaEventDestroy(start_event_);
         if (graph_exec_) cudaGraphExecDestroy(graph_exec_);
         if (stream_) cudaStreamDestroy(stream_);
     }
@@ -331,24 +426,21 @@ class FastPipeline {
         CHECK_CUDA(cudaStreamSynchronize(stream_));
     }
 
-    float process_frame() {
+    float process_frame(bool need_host_output) {
         update_state_controls();
-        cudaEvent_t start, end;
-        CHECK_CUDA(cudaEventCreate(&start));
-        CHECK_CUDA(cudaEventCreate(&end));
-        CHECK_CUDA(cudaEventRecord(start, stream_));
+        CHECK_CUDA(cudaEventRecord(start_event_, stream_));
         CHECK_CUDA(cudaMemcpyAsync(d_src_rgb_.get(), h_src_rgb_.get(), h_src_rgb_.bytes(), cudaMemcpyHostToDevice, stream_));
         {
             std::lock_guard<std::mutex> lock(asset_mutex_);
             CHECK_CUDA(cudaGraphLaunch(graph_exec_, stream_));
         }
-        CHECK_CUDA(cudaMemcpyAsync(h_dst_rgb_.get(), d_dst_rgb_.get(), h_dst_rgb_.bytes(), cudaMemcpyDeviceToHost, stream_));
-        CHECK_CUDA(cudaEventRecord(end, stream_));
-        CHECK_CUDA(cudaEventSynchronize(end));
+        if (need_host_output) {
+            CHECK_CUDA(cudaMemcpyAsync(h_dst_rgb_.get(), d_dst_rgb_.get(), h_dst_rgb_.bytes(), cudaMemcpyDeviceToHost, stream_));
+        }
+        CHECK_CUDA(cudaEventRecord(end_event_, stream_));
+        CHECK_CUDA(cudaEventSynchronize(end_event_));
         float elapsed = 0.0f;
-        CHECK_CUDA(cudaEventElapsedTime(&elapsed, start, end));
-        CHECK_CUDA(cudaEventDestroy(start));
-        CHECK_CUDA(cudaEventDestroy(end));
+        CHECK_CUDA(cudaEventElapsedTime(&elapsed, start_event_, end_event_));
         return elapsed;
     }
 
@@ -416,6 +508,8 @@ class FastPipeline {
     PinnedBuffer<uint8_t> h_src_rgb_, h_dst_rgb_;
     cudaStream_t stream_ = nullptr;
     cudaGraphExec_t graph_exec_ = nullptr;
+    cudaEvent_t start_event_ = nullptr;
+    cudaEvent_t end_event_ = nullptr;
     std::mutex asset_mutex_;
 };
 
@@ -465,8 +559,9 @@ void update_capture_stats(int queued_frames, uint64_t dropped_frames);
 
 class CaptureReader {
   public:
-    CaptureReader(FILE* camera, size_t frame_bytes)
-        : camera_(camera), frame_bytes_(frame_bytes), thread_(&CaptureReader::loop, this) {}
+    CaptureReader(FILE* camera, size_t frame_bytes, int core, int rt_priority)
+        : camera_(camera), frame_bytes_(frame_bytes), core_(core), rt_priority_(rt_priority),
+          thread_(&CaptureReader::loop, this) {}
 
     ~CaptureReader() { stop(); }
 
@@ -503,6 +598,7 @@ class CaptureReader {
 
   private:
     void loop() {
+        configure_current_thread("cap-ffmpeg", core_, rt_priority_);
         while (running_.load() && g_running.load()) {
             std::vector<uint8_t> frame(frame_bytes_);
             if (!read_exact(camera_, frame.data(), frame_bytes_)) break;
@@ -523,6 +619,269 @@ class CaptureReader {
 
     FILE* camera_ = nullptr;
     size_t frame_bytes_ = 0;
+    int core_ = -1;
+    int rt_priority_ = 0;
+    std::atomic<bool> running_{true};
+    std::thread thread_;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::deque<std::vector<uint8_t>> queue_;
+    uint64_t dropped_frames_ = 0;
+};
+
+int xioctl(int fd, unsigned long request, void* arg) {
+    int rc;
+    do {
+        rc = ioctl(fd, request, arg);
+    } while (rc == -1 && errno == EINTR);
+    return rc;
+}
+
+struct JpegErrorManager {
+    jpeg_error_mgr pub;
+    jmp_buf jump;
+    char message[JMSG_LENGTH_MAX];
+};
+
+void jpeg_error_exit(j_common_ptr cinfo) {
+    auto* err = reinterpret_cast<JpegErrorManager*>(cinfo->err);
+    (*cinfo->err->format_message)(cinfo, err->message);
+    longjmp(err->jump, 1);
+}
+
+bool decode_mjpeg_to_rgb(const uint8_t* data, size_t size, std::vector<uint8_t>& rgb, int& width, int& height) {
+    jpeg_decompress_struct cinfo{};
+    JpegErrorManager jerr{};
+    cinfo.err = jpeg_std_error(&jerr.pub);
+    jerr.pub.error_exit = jpeg_error_exit;
+    if (setjmp(jerr.jump)) {
+        jpeg_destroy_decompress(&cinfo);
+        std::cerr << "JPEG decode failed: " << jerr.message << "\n";
+        return false;
+    }
+    jpeg_create_decompress(&cinfo);
+    jpeg_mem_src(&cinfo, const_cast<unsigned char*>(data), size);
+    jpeg_read_header(&cinfo, TRUE);
+    cinfo.out_color_space = JCS_RGB;
+    jpeg_start_decompress(&cinfo);
+    width = static_cast<int>(cinfo.output_width);
+    height = static_cast<int>(cinfo.output_height);
+    int row_stride = width * static_cast<int>(cinfo.output_components);
+    rgb.resize(static_cast<size_t>(row_stride) * height);
+    while (cinfo.output_scanline < cinfo.output_height) {
+        JSAMPROW row = rgb.data() + static_cast<size_t>(cinfo.output_scanline) * row_stride;
+        jpeg_read_scanlines(&cinfo, &row, 1);
+    }
+    jpeg_finish_decompress(&cinfo);
+    jpeg_destroy_decompress(&cinfo);
+    return true;
+}
+
+void crop_resize_rgb_bilinear(const uint8_t* src, int src_w, int src_h, uint8_t* dst) {
+    const int crop = std::min(src_w, src_h);
+    const int x0 = (src_w - crop) / 2;
+    const int y0 = (src_h - crop) / 2;
+    const float scale = static_cast<float>(crop) / static_cast<float>(kWidth);
+    for (int y = 0; y < kHeight; ++y) {
+        float fy = y0 + (static_cast<float>(y) + 0.5f) * scale - 0.5f;
+        int y1 = std::clamp(static_cast<int>(std::floor(fy)), 0, src_h - 1);
+        int y2 = std::min(y1 + 1, src_h - 1);
+        float wy = fy - static_cast<float>(y1);
+        for (int x = 0; x < kWidth; ++x) {
+            float fx = x0 + (static_cast<float>(x) + 0.5f) * scale - 0.5f;
+            int x1 = std::clamp(static_cast<int>(std::floor(fx)), 0, src_w - 1);
+            int x2 = std::min(x1 + 1, src_w - 1);
+            float wx = fx - static_cast<float>(x1);
+            const uint8_t* p11 = src + (static_cast<size_t>(y1) * src_w + x1) * 3;
+            const uint8_t* p12 = src + (static_cast<size_t>(y1) * src_w + x2) * 3;
+            const uint8_t* p21 = src + (static_cast<size_t>(y2) * src_w + x1) * 3;
+            const uint8_t* p22 = src + (static_cast<size_t>(y2) * src_w + x2) * 3;
+            uint8_t* out = dst + (static_cast<size_t>(y) * kWidth + x) * 3;
+            for (int c = 0; c < 3; ++c) {
+                float top = p11[c] + (p12[c] - p11[c]) * wx;
+                float bottom = p21[c] + (p22[c] - p21[c]) * wx;
+                out[c] = static_cast<uint8_t>(std::clamp(top + (bottom - top) * wy, 0.0f, 255.0f));
+            }
+        }
+    }
+}
+
+class V4L2CaptureReader {
+  public:
+    V4L2CaptureReader(const Args& args, size_t frame_bytes)
+        : args_(args), frame_bytes_(frame_bytes) {
+        setup_device();
+        thread_ = std::thread(&V4L2CaptureReader::loop, this);
+    }
+
+    ~V4L2CaptureReader() {
+        stop();
+        close_device();
+    }
+
+    V4L2CaptureReader(const V4L2CaptureReader&) = delete;
+    V4L2CaptureReader& operator=(const V4L2CaptureReader&) = delete;
+
+    bool read_frame(uint8_t* dst) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [&] { return !queue_.empty() || !running_.load() || !g_running.load(); });
+        if (queue_.empty()) return false;
+        if (use_latest_frame_mode()) {
+            if (queue_.size() > 1) {
+                dropped_frames_ += queue_.size() - 1;
+                while (queue_.size() > 1) queue_.pop_front();
+            }
+            std::memcpy(dst, queue_.back().data(), frame_bytes_);
+            queue_.clear();
+        } else {
+            std::memcpy(dst, queue_.front().data(), frame_bytes_);
+            queue_.pop_front();
+        }
+        update_capture_stats(static_cast<int>(queue_.size()), dropped_frames_);
+        return true;
+    }
+
+    void stop() {
+        bool expected = true;
+        if (running_.compare_exchange_strong(expected, false)) {
+            cv_.notify_all();
+            if (thread_.joinable()) thread_.join();
+        }
+    }
+
+  private:
+    struct Buffer {
+        void* start = nullptr;
+        size_t length = 0;
+    };
+
+    void setup_device() {
+        fd_ = open(args_.camera_device.c_str(), O_RDWR | O_NONBLOCK);
+        if (fd_ < 0) throw std::runtime_error("failed to open " + args_.camera_device + ": " + std::strerror(errno));
+
+        v4l2_format fmt{};
+        fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        fmt.fmt.pix.width = args_.capture_width;
+        fmt.fmt.pix.height = args_.capture_height;
+        fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_MJPEG;
+        fmt.fmt.pix.field = V4L2_FIELD_ANY;
+        if (xioctl(fd_, VIDIOC_S_FMT, &fmt) < 0) throw std::runtime_error("VIDIOC_S_FMT failed: " + std::string(std::strerror(errno)));
+        if (fmt.fmt.pix.pixelformat != V4L2_PIX_FMT_MJPEG) throw std::runtime_error("V4L2 device did not accept MJPEG format");
+        actual_width_ = static_cast<int>(fmt.fmt.pix.width);
+        actual_height_ = static_cast<int>(fmt.fmt.pix.height);
+
+        v4l2_streamparm parm{};
+        parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        parm.parm.capture.timeperframe.numerator = 1;
+        parm.parm.capture.timeperframe.denominator = args_.camera_fps;
+        if (xioctl(fd_, VIDIOC_S_PARM, &parm) < 0) warn_errno("VIDIOC_S_PARM");
+
+        v4l2_requestbuffers req{};
+        req.count = 4;
+        req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        req.memory = V4L2_MEMORY_MMAP;
+        if (xioctl(fd_, VIDIOC_REQBUFS, &req) < 0) throw std::runtime_error("VIDIOC_REQBUFS failed: " + std::string(std::strerror(errno)));
+        if (req.count < 2) throw std::runtime_error("V4L2 returned too few mmap buffers");
+
+        buffers_.resize(req.count);
+        for (size_t i = 0; i < buffers_.size(); ++i) {
+            v4l2_buffer buf{};
+            buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+            buf.memory = V4L2_MEMORY_MMAP;
+            buf.index = static_cast<uint32_t>(i);
+            if (xioctl(fd_, VIDIOC_QUERYBUF, &buf) < 0) throw std::runtime_error("VIDIOC_QUERYBUF failed: " + std::string(std::strerror(errno)));
+            buffers_[i].length = buf.length;
+            buffers_[i].start = mmap(nullptr, buf.length, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, buf.m.offset);
+            if (buffers_[i].start == MAP_FAILED) throw std::runtime_error("mmap V4L2 buffer failed: " + std::string(std::strerror(errno)));
+            if (xioctl(fd_, VIDIOC_QBUF, &buf) < 0) throw std::runtime_error("VIDIOC_QBUF failed: " + std::string(std::strerror(errno)));
+        }
+
+        v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        if (xioctl(fd_, VIDIOC_STREAMON, &type) < 0) throw std::runtime_error("VIDIOC_STREAMON failed: " + std::string(std::strerror(errno)));
+        streaming_ = true;
+        std::cerr << "camera: v4l2 mmap MJPEG " << actual_width_ << "x" << actual_height_
+                  << " @" << args_.camera_fps << " from " << args_.camera_device << "\n";
+    }
+
+    void close_device() {
+        if (streaming_) {
+            v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+            xioctl(fd_, VIDIOC_STREAMOFF, &type);
+            streaming_ = false;
+        }
+        for (auto& buffer : buffers_) {
+            if (buffer.start && buffer.start != MAP_FAILED) munmap(buffer.start, buffer.length);
+        }
+        buffers_.clear();
+        if (fd_ >= 0) {
+            close(fd_);
+            fd_ = -1;
+        }
+    }
+
+    void loop() {
+        configure_current_thread("cap-v4l2", args_.capture_core, args_.rt_priority);
+        while (running_.load() && g_running.load()) {
+            pollfd pfd{};
+            pfd.fd = fd_;
+            pfd.events = POLLIN;
+            int prc = poll(&pfd, 1, 250);
+            if (prc < 0) {
+                if (errno == EINTR) continue;
+                warn_errno("poll V4L2");
+                break;
+            }
+            if (prc == 0) continue;
+
+            v4l2_buffer buf{};
+            buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+            buf.memory = V4L2_MEMORY_MMAP;
+            if (xioctl(fd_, VIDIOC_DQBUF, &buf) < 0) {
+                if (errno == EAGAIN) continue;
+                warn_errno("VIDIOC_DQBUF");
+                break;
+            }
+
+            int jpeg_w = 0;
+            int jpeg_h = 0;
+            bool ok = decode_mjpeg_to_rgb(
+                static_cast<const uint8_t*>(buffers_[buf.index].start),
+                buf.bytesused,
+                decoded_rgb_,
+                jpeg_w,
+                jpeg_h);
+            if (ok) {
+                std::vector<uint8_t> frame(frame_bytes_);
+                crop_resize_rgb_bilinear(decoded_rgb_.data(), jpeg_w, jpeg_h, frame.data());
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    if (use_latest_frame_mode()) {
+                        dropped_frames_ += queue_.size();
+                        queue_.clear();
+                    }
+                    queue_.push_back(std::move(frame));
+                    update_capture_stats(static_cast<int>(queue_.size()), dropped_frames_);
+                }
+                cv_.notify_one();
+            }
+
+            if (xioctl(fd_, VIDIOC_QBUF, &buf) < 0) {
+                warn_errno("VIDIOC_QBUF");
+                break;
+            }
+        }
+        running_.store(false);
+        cv_.notify_all();
+    }
+
+    const Args& args_;
+    size_t frame_bytes_ = 0;
+    int fd_ = -1;
+    int actual_width_ = 0;
+    int actual_height_ = 0;
+    bool streaming_ = false;
+    std::vector<Buffer> buffers_;
+    std::vector<uint8_t> decoded_rgb_;
     std::atomic<bool> running_{true};
     std::thread thread_;
     std::mutex mutex_;
@@ -556,7 +915,7 @@ input[type=range]{width:100%}textarea{width:100%;height:88px}button{cursor:point
 const ui={};
 for (const id of ['status','prompt','seed','strength','strengthv','steps','blend','blendv','passthrough','frame_mode','resolution','apply']) ui[id]=document.getElementById(id);
 async function getState(){const r=await fetch('/api/state',{cache:'no-store'});if(!r.ok)throw new Error(`HTTP ${r.status}`);return await r.json()}
-function statusLine(s){return `${s.status} | ${s.fps.toFixed(1)} fps | ${s.frame_ms.toFixed(2)} ms | queued ${s.queued_frames} | dropped ${s.dropped_frames}`}
+function statusLine(s){return `${s.status} | ${s.fps.toFixed(1)} fps | model ${s.frame_ms.toFixed(2)} ms | capture ${s.capture_ms.toFixed(2)} ms | display ${s.display_ms.toFixed(2)} ms | loop ${s.loop_ms.toFixed(2)} ms | queued ${s.queued_frames} | dropped ${s.dropped_frames}`}
 function fill(s){ui.status.textContent=statusLine(s);
 ui.prompt.value=s.prompt;ui.seed.value=s.seed;ui.strength.value=s.strength;ui.strengthv.textContent=s.strength.toFixed(2);
 ui.steps.value=s.steps;ui.blend.value=s.blend;ui.blendv.textContent=s.blend.toFixed(2);ui.passthrough.checked=s.passthrough;
@@ -595,6 +954,9 @@ std::string state_json() {
         << "\"height\":" << g_state.height << ","
         << "\"fps\":" << g_state.fps << ","
         << "\"frame_ms\":" << g_state.frame_ms << ","
+        << "\"capture_ms\":" << g_state.capture_ms << ","
+        << "\"display_ms\":" << g_state.display_ms << ","
+        << "\"loop_ms\":" << g_state.loop_ms << ","
         << "\"queued_frames\":" << g_state.queued_frames << ","
         << "\"dropped_frames\":" << g_state.dropped_frames << ","
         << "\"status\":\"" << json_escape(g_state.status) << "\""
@@ -756,7 +1118,8 @@ int bind_udp_any(int port) {
     return sock;
 }
 
-void http_thread(int port) {
+void http_thread(int port, int core, int rt_priority) {
+    configure_current_thread("http", core, rt_priority > 0 ? 1 : 0);
     int server = bind_tcp_any(port);
     if (server < 0) {
         std::cerr << "HTTP bind/listen failed on port " << port << "\n";
@@ -834,7 +1197,8 @@ void handle_osc(const char* data, size_t size) {
     if (wrote) apply_json_state(json.str());
 }
 
-void osc_thread(int port) {
+void osc_thread(int port, int core, int rt_priority) {
+    configure_current_thread("osc", core, rt_priority > 0 ? 2 : 0);
     int sock = bind_udp_any(port);
     if (sock < 0) {
         std::cerr << "OSC bind failed on port " << port << "\n";
@@ -849,6 +1213,7 @@ void osc_thread(int port) {
 }
 
 void asset_reload_thread(const Args& args, FastPipeline* pipeline) {
+    configure_current_thread("asset-reload", args.reload_core, 0);
     while (g_running.load()) {
         bool reload = false;
         AppState snapshot;
@@ -896,19 +1261,21 @@ int main(int argc, char** argv) {
         Args args = parse_args(argc, argv);
         signal(SIGINT, on_signal);
         signal(SIGTERM, on_signal);
+        configure_current_thread("main-frame", args.main_core, args.rt_priority);
         CHECK_CUDA(cudaSetDevice(0));
         Logger logger;
         initLibNvInferPlugins(&logger, "");
 
         FastPipeline pipeline(args, logger);
+        if (args.lock_memory) try_lock_process_memory();
         {
             std::lock_guard<std::mutex> lock(g_state_mutex);
             g_state.status = "running";
         }
 
-        std::thread http(http_thread, args.http_port);
+        std::thread http(http_thread, args.http_port, args.http_core, args.rt_priority);
         http.detach();
-        std::thread osc(osc_thread, args.osc_port);
+        std::thread osc(osc_thread, args.osc_port, args.osc_core, args.rt_priority);
         osc.detach();
         std::string mdns = local_mdns_name();
         std::cerr << "HTTP: http://0.0.0.0:" << args.http_port
@@ -920,14 +1287,25 @@ int main(int argc, char** argv) {
         std::thread reloader(asset_reload_thread, std::cref(args), &pipeline);
         reloader.detach();
 
-        std::string cap_cmd = ffmpeg_capture_cmd(args);
-        std::cerr << "camera: " << cap_cmd << "\n";
-        FILE* camera = popen(cap_cmd.c_str(), "r");
-        if (!camera) throw std::runtime_error("failed to start ffmpeg camera");
-        CaptureReader capture(camera, pipeline.rgb_bytes());
+        FILE* camera = nullptr;
+        std::unique_ptr<CaptureReader> ffmpeg_capture;
+        std::unique_ptr<V4L2CaptureReader> v4l2_capture;
+        if (args.capture_backend == "v4l2") {
+            v4l2_capture.reset(new V4L2CaptureReader(args, pipeline.rgb_bytes()));
+        } else {
+            std::string cap_cmd = ffmpeg_capture_cmd(args);
+            std::cerr << "camera: " << cap_cmd << "\n";
+            camera = popen(cap_cmd.c_str(), "r");
+            if (!camera) throw std::runtime_error("failed to start ffmpeg camera");
+            ffmpeg_capture.reset(new CaptureReader(camera, pipeline.rgb_bytes(), args.capture_core, args.rt_priority));
+        }
+        auto read_capture = [&](uint8_t* dst) -> bool {
+            if (v4l2_capture) return v4l2_capture->read_frame(dst);
+            return ffmpeg_capture->read_frame(dst);
+        };
 
         FILE* display = nullptr;
-        if (!args.no_display) {
+        if (args.display_backend == "ffplay") {
             std::string display_cmd = ffplay_display_cmd();
             std::cerr << "display: " << display_cmd << "\n";
             display = popen(display_cmd.c_str(), "w");
@@ -939,9 +1317,14 @@ int main(int argc, char** argv) {
         auto fps_start = std::chrono::steady_clock::now();
         while (g_running.load()) {
             if (args.max_frames > 0 && total_frames >= args.max_frames) break;
-            if (!capture.read_frame(pipeline.host_input())) break;
-            float frame_ms = pipeline.process_frame();
+            auto loop_start = std::chrono::steady_clock::now();
+            auto capture_start = std::chrono::steady_clock::now();
+            if (!read_capture(pipeline.host_input())) break;
+            auto capture_end = std::chrono::steady_clock::now();
+            float frame_ms = pipeline.process_frame(display != nullptr);
+            auto display_start = std::chrono::steady_clock::now();
             if (display && !write_exact(display, pipeline.host_output(), pipeline.rgb_bytes())) break;
+            auto display_end = std::chrono::steady_clock::now();
             ++frames;
             ++total_frames;
             auto now = std::chrono::steady_clock::now();
@@ -950,13 +1333,17 @@ int main(int argc, char** argv) {
                 std::lock_guard<std::mutex> lock(g_state_mutex);
                 g_state.fps = frames / elapsed;
                 g_state.frame_ms = frame_ms;
+                g_state.capture_ms = std::chrono::duration<double, std::milli>(capture_end - capture_start).count();
+                g_state.display_ms = std::chrono::duration<double, std::milli>(display_end - display_start).count();
+                g_state.loop_ms = std::chrono::duration<double, std::milli>(now - loop_start).count();
                 fps_start = now;
                 frames = 0;
             }
         }
         g_running.store(false);
-        capture.stop();
-        pclose(camera);
+        if (v4l2_capture) v4l2_capture->stop();
+        if (ffmpeg_capture) ffmpeg_capture->stop();
+        if (camera) pclose(camera);
         if (display) pclose(display);
         return 0;
     } catch (const std::exception& e) {

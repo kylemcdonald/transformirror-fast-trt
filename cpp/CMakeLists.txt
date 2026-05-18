@@ -37,5 +37,6 @@ target_link_libraries(
     nvinfer
     nvinfer_plugin
     cudart
+    jpeg
     pthread
 )
