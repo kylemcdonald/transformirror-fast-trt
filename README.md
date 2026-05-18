@@ -35,6 +35,7 @@ In the webcam app, the BRIO at 1920x1080 MJPEG/30 is camera-limited around
 * serves a browser control frontend over HTTP
 * receives OSC control messages over UDP
 * hot-loads prompt/seed/strength/step conditioning assets without restarting
+* defaults to lowest-latency capture: always process the newest camera frame
 
 The frame loop is C++/CUDA/TensorRT. Prompt/seed/strength/step edits are handled
 out of band by a Python helper because text encoding is not in the realtime loop.
@@ -116,11 +117,16 @@ Update:
 ```bash
 curl -X POST http://localhost:8080/api/state \
   -H 'Content-Type: application/json' \
-  -d '{"prompt":"a neon mirror portrait","seed":42,"strength":0.7,"steps":2,"blend":0.5}'
+  -d '{"prompt":"a neon mirror portrait","seed":42,"strength":0.7,"steps":2,"blend":0.5,"use_latest_frame":true}'
 ```
 
 Prompt, seed, strength, and steps trigger asynchronous conditioning regeneration.
 Blend and passthrough update immediately.
+
+`use_latest_frame` controls capture behavior:
+
+* `true` - default, drain camera input continuously and process the newest frame
+* `false` - FIFO mode, do not drop frames
 
 ## OSC
 
@@ -135,6 +141,8 @@ Supported addresses:
 /steps         int
 /blend         float
 /passthrough   int/bool
+/use_latest_frame int/bool
+/frame_mode    string, "latest" or "fifo"
 /width         int
 /height        int
 ```

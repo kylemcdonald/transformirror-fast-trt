@@ -14,11 +14,13 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -89,10 +91,13 @@ struct AppState {
     int steps = 2;
     float blend = 1.0f;
     bool passthrough = false;
+    bool use_latest_frame = true;
     int width = kWidth;
     int height = kHeight;
     double fps = 0.0;
     double frame_ms = 0.0;
+    int queued_frames = 0;
+    uint64_t dropped_frames = 0;
     std::string status = "starting";
     bool reload_requested = false;
 };
@@ -417,7 +422,8 @@ class FastPipeline {
 std::string ffmpeg_capture_cmd(const Args& args) {
     std::ostringstream cmd;
     cmd << "ffmpeg -hide_banner -loglevel error "
-        << "-f v4l2 -input_format mjpeg -video_size " << args.capture_width << "x" << args.capture_height
+        << "-fflags nobuffer -flags low_delay "
+        << "-f v4l2 -thread_queue_size 1 -input_format mjpeg -video_size " << args.capture_width << "x" << args.capture_height
         << " -framerate " << args.camera_fps
         << " -i " << shell_quote(args.camera_device)
         << " -vf 'crop=ih:ih:(iw-ih)/2:0,scale=" << kWidth << ":" << kHeight << "'"
@@ -454,6 +460,77 @@ bool write_exact(FILE* file, const uint8_t* src, size_t bytes) {
     return sent == bytes;
 }
 
+bool use_latest_frame_mode();
+void update_capture_stats(int queued_frames, uint64_t dropped_frames);
+
+class CaptureReader {
+  public:
+    CaptureReader(FILE* camera, size_t frame_bytes)
+        : camera_(camera), frame_bytes_(frame_bytes), thread_(&CaptureReader::loop, this) {}
+
+    ~CaptureReader() { stop(); }
+
+    CaptureReader(const CaptureReader&) = delete;
+    CaptureReader& operator=(const CaptureReader&) = delete;
+
+    bool read_frame(uint8_t* dst) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [&] { return !queue_.empty() || !running_.load() || !g_running.load(); });
+        if (queue_.empty()) return false;
+
+        if (use_latest_frame_mode()) {
+            if (queue_.size() > 1) {
+                dropped_frames_ += queue_.size() - 1;
+                while (queue_.size() > 1) queue_.pop_front();
+            }
+            std::memcpy(dst, queue_.back().data(), frame_bytes_);
+            queue_.clear();
+        } else {
+            std::memcpy(dst, queue_.front().data(), frame_bytes_);
+            queue_.pop_front();
+        }
+        update_capture_stats(static_cast<int>(queue_.size()), dropped_frames_);
+        return true;
+    }
+
+    void stop() {
+        bool expected = true;
+        if (running_.compare_exchange_strong(expected, false)) {
+            cv_.notify_all();
+            if (thread_.joinable()) thread_.join();
+        }
+    }
+
+  private:
+    void loop() {
+        while (running_.load() && g_running.load()) {
+            std::vector<uint8_t> frame(frame_bytes_);
+            if (!read_exact(camera_, frame.data(), frame_bytes_)) break;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (use_latest_frame_mode()) {
+                    dropped_frames_ += queue_.size();
+                    queue_.clear();
+                }
+                queue_.push_back(std::move(frame));
+                update_capture_stats(static_cast<int>(queue_.size()), dropped_frames_);
+            }
+            cv_.notify_one();
+        }
+        running_.store(false);
+        cv_.notify_all();
+    }
+
+    FILE* camera_ = nullptr;
+    size_t frame_bytes_ = 0;
+    std::atomic<bool> running_{true};
+    std::thread thread_;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::deque<std::vector<uint8_t>> queue_;
+    uint64_t dropped_frames_ = 0;
+};
+
 std::string html_page() {
     return R"HTML(<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -472,17 +549,19 @@ input[type=range]{width:100%}textarea{width:100%;height:88px}button{cursor:point
 <label>Steps</label><input id="steps" type="number" min="1" max="8">
 <label>Blend</label><div class="row"><input id="blend" type="range" min="0" max="1" step="0.01"><span id="blendv"></span></div>
 <label><input id="passthrough" type="checkbox"> Passthrough</label>
+<label>Frame handling</label><select id="frame_mode"><option value="latest">Always use newest frame</option><option value="fifo">Do not drop frames</option></select>
 <label>Resolution</label><input id="resolution" value="1024x1024">
 <p><button id="apply">Apply</button></p>
 <script>
 async function state(){return await (await fetch('/api/state')).json()}
-function fill(s){status.textContent=`${s.status} | ${s.fps.toFixed(1)} fps | ${s.frame_ms.toFixed(2)} ms`;
+function fill(s){status.textContent=`${s.status} | ${s.fps.toFixed(1)} fps | ${s.frame_ms.toFixed(2)} ms | queued ${s.queued_frames} | dropped ${s.dropped_frames}`;
 prompt.value=s.prompt;seed.value=s.seed;strength.value=s.strength;strengthv.textContent=s.strength.toFixed(2);
 steps.value=s.steps;blend.value=s.blend;blendv.textContent=s.blend.toFixed(2);passthrough.checked=s.passthrough;
+frame_mode.value=s.use_latest_frame?'latest':'fifo';
 resolution.value=`${s.width}x${s.height}`}
 for (const id of ['strength','blend']) document.getElementById(id).oninput=()=>document.getElementById(id+'v').textContent=(+document.getElementById(id).value).toFixed(2);
-apply.onclick=async()=>{let [w,h]=resolution.value.split('x').map(Number);await fetch('/api/state',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:prompt.value,seed:+seed.value,strength:+strength.value,steps:+steps.value,blend:+blend.value,passthrough:passthrough.checked,width:w||1024,height:h||1024})});fill(await state())}
-setInterval(async()=>{let s=await state();status.textContent=`${s.status} | ${s.fps.toFixed(1)} fps | ${s.frame_ms.toFixed(2)} ms`},1000);
+apply.onclick=async()=>{let [w,h]=resolution.value.split('x').map(Number);await fetch('/api/state',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:prompt.value,seed:+seed.value,strength:+strength.value,steps:+steps.value,blend:+blend.value,passthrough:passthrough.checked,use_latest_frame:frame_mode.value==='latest',width:w||1024,height:h||1024})});fill(await state())}
+setInterval(async()=>{let s=await state();status.textContent=`${s.status} | ${s.fps.toFixed(1)} fps | ${s.frame_ms.toFixed(2)} ms | queued ${s.queued_frames} | dropped ${s.dropped_frames}`},1000);
 state().then(fill);
 </script></body></html>)HTML";
 }
@@ -507,10 +586,13 @@ std::string state_json() {
         << "\"steps\":" << g_state.steps << ","
         << "\"blend\":" << g_state.blend << ","
         << "\"passthrough\":" << (g_state.passthrough ? "true" : "false") << ","
+        << "\"use_latest_frame\":" << (g_state.use_latest_frame ? "true" : "false") << ","
         << "\"width\":" << g_state.width << ","
         << "\"height\":" << g_state.height << ","
         << "\"fps\":" << g_state.fps << ","
         << "\"frame_ms\":" << g_state.frame_ms << ","
+        << "\"queued_frames\":" << g_state.queued_frames << ","
+        << "\"dropped_frames\":" << g_state.dropped_frames << ","
         << "\"status\":\"" << json_escape(g_state.status) << "\""
         << "}";
     return out.str();
@@ -570,12 +652,25 @@ void apply_json_state(const std::string& body) {
     if (find_number(body, "steps", n) && static_cast<int>(n) != g_state.steps) { g_state.steps = std::clamp(static_cast<int>(n), 1, 8); reload = true; }
     if (find_number(body, "blend", n)) g_state.blend = std::clamp(static_cast<float>(n), 0.0f, 1.0f);
     if (find_bool(body, "passthrough", b)) g_state.passthrough = b;
+    if (find_bool(body, "use_latest_frame", b)) g_state.use_latest_frame = b;
+    if (find_string(body, "frame_mode", s)) g_state.use_latest_frame = (s != "fifo" && s != "no_drop");
     if (find_number(body, "width", n) && static_cast<int>(n) != kWidth) g_state.status = "resolution requires matching TensorRT engines; using 1024x1024";
     if (find_number(body, "height", n) && static_cast<int>(n) != kHeight) g_state.status = "resolution requires matching TensorRT engines; using 1024x1024";
     if (reload) {
         g_state.reload_requested = true;
         g_state.status = "conditioning reload queued";
     }
+}
+
+bool use_latest_frame_mode() {
+    std::lock_guard<std::mutex> lock(g_state_mutex);
+    return g_state.use_latest_frame;
+}
+
+void update_capture_stats(int queued_frames, uint64_t dropped_frames) {
+    std::lock_guard<std::mutex> lock(g_state_mutex);
+    g_state.queued_frames = queued_frames;
+    g_state.dropped_frames = dropped_frames;
 }
 
 void send_http(int client, const std::string& code, const std::string& type, const std::string& body) {
@@ -652,6 +747,8 @@ void handle_osc(const char* data, size_t size) {
     if (name.rfind(prefix, 0) == 0) name = name.substr(prefix.size());
     if (name == "/prompt" && types.find('s') != std::string::npos && pos < size) {
         add_comma(); json << "\"prompt\":\"" << json_escape(std::string(data + pos)) << "\"";
+    } else if (name == "/frame_mode" && types.find('s') != std::string::npos && pos < size) {
+        add_comma(); json << "\"frame_mode\":\"" << json_escape(std::string(data + pos)) << "\"";
     } else if ((name == "/seed" || name == "/steps" || name == "/width" || name == "/height") && types.find('i') != std::string::npos && pos + 4 <= size) {
         int value = static_cast<int>(read_be32(data + pos));
         add_comma();
@@ -662,6 +759,8 @@ void handle_osc(const char* data, size_t size) {
         add_comma(); json << "\"" << name.substr(1) << "\":" << read_befloat(data + pos);
     } else if (name == "/passthrough" && pos + 4 <= size) {
         add_comma(); json << "\"passthrough\":" << (read_be32(data + pos) ? "true" : "false");
+    } else if (name == "/use_latest_frame" && pos + 4 <= size) {
+        add_comma(); json << "\"use_latest_frame\":" << (read_be32(data + pos) ? "true" : "false");
     }
     json << "}";
     if (wrote) apply_json_state(json.str());
@@ -754,6 +853,7 @@ int main(int argc, char** argv) {
         std::cerr << "camera: " << cap_cmd << "\n";
         FILE* camera = popen(cap_cmd.c_str(), "r");
         if (!camera) throw std::runtime_error("failed to start ffmpeg camera");
+        CaptureReader capture(camera, pipeline.rgb_bytes());
 
         FILE* display = nullptr;
         if (!args.no_display) {
@@ -768,7 +868,7 @@ int main(int argc, char** argv) {
         auto fps_start = std::chrono::steady_clock::now();
         while (g_running.load()) {
             if (args.max_frames > 0 && total_frames >= args.max_frames) break;
-            if (!read_exact(camera, pipeline.host_input(), pipeline.rgb_bytes())) break;
+            if (!capture.read_frame(pipeline.host_input())) break;
             float frame_ms = pipeline.process_frame();
             if (display && !write_exact(display, pipeline.host_output(), pipeline.rgb_bytes())) break;
             ++frames;
@@ -784,6 +884,7 @@ int main(int argc, char** argv) {
             }
         }
         g_running.store(false);
+        capture.stop();
         pclose(camera);
         if (display) pclose(display);
         return 0;
