@@ -110,6 +110,7 @@ def export(module, inputs, path, input_names, output_names):
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--out-dir", type=Path, default=Path("onnx"))
+    parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument(
         "--component",
         choices=("unet", "vae-encode", "vae-decode", "full", "all"),
@@ -120,17 +121,25 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.batch_size < 1:
+        raise ValueError("--batch-size must be >= 1")
     disable_progress_bar()
     torch.set_grad_enabled(False)
     device = torch.device("cuda:0")
     pipe = build_original_pipeline(device)
     image = to_input_tensor(make_test_image(1024, 1024), device)
+    if args.batch_size > 1:
+        image = image.repeat(args.batch_size, 1, 1, 1).contiguous()
     runner = ManualSDXLTurboImg2Img(pipe, PROMPT, 1024, 1024, 2, 0.7, 0, device)
 
-    latents = torch.empty((1, 4, 128, 128), device=device, dtype=torch.float16)
+    latents = torch.empty((args.batch_size, 4, 128, 128), device=device, dtype=torch.float16)
     timestep = runner.timesteps[:1].to(device=device, dtype=torch.float32)
     sigma = runner.sigma.reshape(())
     sigma_scale = runner.sigma_scale.reshape(())
+    prompt_embeds = runner.prompt_embeds.repeat(args.batch_size, 1, 1).contiguous()
+    text_embeds = runner.added_cond_kwargs["text_embeds"].repeat(args.batch_size, 1).contiguous()
+    time_ids = runner.added_cond_kwargs["time_ids"].repeat(args.batch_size, 1).contiguous()
+    noise = runner.noise.repeat(args.batch_size, 1, 1, 1).contiguous()
 
     if args.component in ("vae-encode", "all"):
         export(
@@ -156,9 +165,9 @@ def main():
             (
                 latents,
                 timestep,
-                runner.prompt_embeds,
-                runner.added_cond_kwargs["text_embeds"],
-                runner.added_cond_kwargs["time_ids"],
+                prompt_embeds,
+                text_embeds,
+                time_ids,
             ),
             args.out_dir / "sdxl_turbo_unet.onnx",
             ["sample", "timestep", "encoder_hidden_states", "text_embeds", "time_ids"],
@@ -170,11 +179,11 @@ def main():
             FullPipelineWrapper(pipe.vae, pipe.unet, torch.tensor(pipe.vae.config.scaling_factor, device=device, dtype=torch.float16), sigma, sigma_scale),
             (
                 image,
-                runner.noise,
+                noise,
                 timestep,
-                runner.prompt_embeds,
-                runner.added_cond_kwargs["text_embeds"],
-                runner.added_cond_kwargs["time_ids"],
+                prompt_embeds,
+                text_embeds,
+                time_ids,
             ),
             args.out_dir / "sdxl_turbo_full_img2img.onnx",
             ["image", "noise", "timestep", "encoder_hidden_states", "text_embeds", "time_ids"],

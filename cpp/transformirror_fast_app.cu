@@ -682,15 +682,79 @@ void send_http(int client, const std::string& code, const std::string& type, con
     send(client, text.data(), text.size(), 0);
 }
 
-void http_thread(int port) {
-    int server = socket(AF_INET, SOCK_STREAM, 0);
+std::string local_mdns_name() {
+    char host[256] = {};
+    if (gethostname(host, sizeof(host) - 1) != 0 || host[0] == '\0') return "localhost";
+    return std::string(host) + ".local";
+}
+
+int bind_tcp_any(int port) {
+    int server = socket(AF_INET6, SOCK_STREAM, 0);
+    if (server >= 0) {
+        int opt = 1;
+        int dual_stack = 0;
+        setsockopt(server, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+        setsockopt(server, IPPROTO_IPV6, IPV6_V6ONLY, &dual_stack, sizeof(dual_stack));
+        sockaddr_in6 addr{};
+        addr.sin6_family = AF_INET6;
+        addr.sin6_addr = in6addr_any;
+        addr.sin6_port = htons(port);
+        if (bind(server, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0 &&
+            listen(server, 16) == 0) {
+            return server;
+        }
+        close(server);
+    }
+
+    server = socket(AF_INET, SOCK_STREAM, 0);
+    if (server < 0) return -1;
     int opt = 1;
     setsockopt(server, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port = htons(port);
-    if (bind(server, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 || listen(server, 16) != 0) {
+    if (bind(server, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 ||
+        listen(server, 16) != 0) {
+        close(server);
+        return -1;
+    }
+    return server;
+}
+
+int bind_udp_any(int port) {
+    int sock = socket(AF_INET6, SOCK_DGRAM, 0);
+    if (sock >= 0) {
+        int opt = 1;
+        int dual_stack = 0;
+        setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+        setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, &dual_stack, sizeof(dual_stack));
+        sockaddr_in6 addr{};
+        addr.sin6_family = AF_INET6;
+        addr.sin6_addr = in6addr_any;
+        addr.sin6_port = htons(port);
+        if (bind(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0) return sock;
+        close(sock);
+    }
+
+    sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) return -1;
+    int opt = 1;
+    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(port);
+    if (bind(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+        close(sock);
+        return -1;
+    }
+    return sock;
+}
+
+void http_thread(int port) {
+    int server = bind_tcp_any(port);
+    if (server < 0) {
         std::cerr << "HTTP bind/listen failed on port " << port << "\n";
         return;
     }
@@ -767,12 +831,8 @@ void handle_osc(const char* data, size_t size) {
 }
 
 void osc_thread(int port) {
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(port);
-    if (bind(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+    int sock = bind_udp_any(port);
+    if (sock < 0) {
         std::cerr << "OSC bind failed on port " << port << "\n";
         return;
     }
@@ -846,6 +906,13 @@ int main(int argc, char** argv) {
         http.detach();
         std::thread osc(osc_thread, args.osc_port);
         osc.detach();
+        std::string mdns = local_mdns_name();
+        std::cerr << "HTTP: http://0.0.0.0:" << args.http_port
+                  << "/ http://[::]:" << args.http_port
+                  << "/ http://" << mdns << ":" << args.http_port << "/\n";
+        std::cerr << "OSC: udp://0.0.0.0:" << args.osc_port
+                  << " udp://[::]:" << args.osc_port
+                  << " udp://" << mdns << ":" << args.osc_port << "\n";
         std::thread reloader(asset_reload_thread, std::cref(args), &pipeline);
         reloader.detach();
 

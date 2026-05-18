@@ -23,6 +23,17 @@ Measured on an RTX 5090 with TensorRT 10.12, CUDA 12.8, and a Logitech BRIO:
 In the webcam app, the BRIO at 1920x1080 MJPEG/30 is camera-limited around
 30 FPS. The model path itself is right at the 30 FPS boundary for 1024x1024.
 
+Batching was tested with static TensorRT engines:
+
+| Batch | Core batch mean | Core per frame | Upload+download batch mean | Upload+download per frame |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 31.33 ms | 31.33 ms | 32.05 ms | 32.05 ms |
+| 2 | 60.39 ms | 30.19 ms | 61.13 ms | 30.57 ms |
+| 4 | 117.11 ms | 29.28 ms | 117.90 ms | 29.47 ms |
+
+Batch 4 only improves throughput about 8% while adding batch-fill latency. For
+single-webcam use, the live app stays on the lower-latency single-frame path.
+
 ## What This App Does
 
 `transformirror_fast_app`:
@@ -78,6 +89,17 @@ source .venv/bin/activate
 TensorRT plans are GPU and TensorRT-version specific. Build them on the machine
 that will run the app. For a 4090, run the same build script on the 4090.
 
+Optional batching benchmark:
+
+```bash
+source .venv/bin/activate
+python export_onnx_components.py --component all --batch-size 4 --out-dir /tmp/sdxl_trt_batch_b4
+/usr/src/tensorrt/bin/trtexec --onnx=/tmp/sdxl_trt_batch_b4/taesdxl_encode.onnx --fp16 --saveEngine=/tmp/sdxl_trt_batch_b4/taesdxl_encode.plan
+/usr/src/tensorrt/bin/trtexec --onnx=/tmp/sdxl_trt_batch_b4/taesdxl_decode.onnx --fp16 --saveEngine=/tmp/sdxl_trt_batch_b4/taesdxl_decode.plan
+/usr/src/tensorrt/bin/trtexec --onnx=/tmp/sdxl_trt_batch_b4/sdxl_turbo_unet.onnx --fp16 --saveEngine=/tmp/sdxl_trt_batch_b4/sdxl_turbo_unet.plan --useCudaGraph
+python benchmark_trt_batch.py --engine-dir /tmp/sdxl_trt_batch_b4 --batch-size 4 --include-upload --include-download
+```
+
 ## Run
 
 Headless smoke test:
@@ -102,7 +124,12 @@ Open the control UI:
 
 ```text
 http://localhost:8080/
+http://<hostname>.local:8080/
 ```
+
+HTTP and OSC bind to all IPv4 and IPv6 interfaces. On Linux with Avahi/mDNS
+enabled, the same HTTP UI and OSC UDP port are reachable at
+`<hostname>.local`.
 
 ## HTTP API
 
@@ -199,6 +226,7 @@ References:
 
 * `cpp/transformirror_fast_app.cu` - webcam app
 * `cpp/trt_sdxl_runner.cu` - benchmark runner
+* `benchmark_trt_batch.py` - static batch TensorRT benchmark helper
 * `export_onnx_components.py` - ONNX export for VAE/UNet
 * `export_cpp_assets.py` - prompt/noise/scheduler asset export
 * `scripts/build_default_engines.sh` - default 1024x1024 build
