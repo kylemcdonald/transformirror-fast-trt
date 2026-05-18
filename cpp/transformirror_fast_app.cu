@@ -553,16 +553,20 @@ input[type=range]{width:100%}textarea{width:100%;height:88px}button{cursor:point
 <label>Resolution</label><input id="resolution" value="1024x1024">
 <p><button id="apply">Apply</button></p>
 <script>
-async function state(){return await (await fetch('/api/state')).json()}
-function fill(s){status.textContent=`${s.status} | ${s.fps.toFixed(1)} fps | ${s.frame_ms.toFixed(2)} ms | queued ${s.queued_frames} | dropped ${s.dropped_frames}`;
-prompt.value=s.prompt;seed.value=s.seed;strength.value=s.strength;strengthv.textContent=s.strength.toFixed(2);
-steps.value=s.steps;blend.value=s.blend;blendv.textContent=s.blend.toFixed(2);passthrough.checked=s.passthrough;
-frame_mode.value=s.use_latest_frame?'latest':'fifo';
-resolution.value=`${s.width}x${s.height}`}
-for (const id of ['strength','blend']) document.getElementById(id).oninput=()=>document.getElementById(id+'v').textContent=(+document.getElementById(id).value).toFixed(2);
-apply.onclick=async()=>{let [w,h]=resolution.value.split('x').map(Number);await fetch('/api/state',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:prompt.value,seed:+seed.value,strength:+strength.value,steps:+steps.value,blend:+blend.value,passthrough:passthrough.checked,use_latest_frame:frame_mode.value==='latest',width:w||1024,height:h||1024})});fill(await state())}
-setInterval(async()=>{let s=await state();status.textContent=`${s.status} | ${s.fps.toFixed(1)} fps | ${s.frame_ms.toFixed(2)} ms | queued ${s.queued_frames} | dropped ${s.dropped_frames}`},1000);
-state().then(fill);
+const ui={};
+for (const id of ['status','prompt','seed','strength','strengthv','steps','blend','blendv','passthrough','frame_mode','resolution','apply']) ui[id]=document.getElementById(id);
+async function getState(){const r=await fetch('/api/state',{cache:'no-store'});if(!r.ok)throw new Error(`HTTP ${r.status}`);return await r.json()}
+function statusLine(s){return `${s.status} | ${s.fps.toFixed(1)} fps | ${s.frame_ms.toFixed(2)} ms | queued ${s.queued_frames} | dropped ${s.dropped_frames}`}
+function fill(s){ui.status.textContent=statusLine(s);
+ui.prompt.value=s.prompt;ui.seed.value=s.seed;ui.strength.value=s.strength;ui.strengthv.textContent=s.strength.toFixed(2);
+ui.steps.value=s.steps;ui.blend.value=s.blend;ui.blendv.textContent=s.blend.toFixed(2);ui.passthrough.checked=s.passthrough;
+ui.frame_mode.value=s.use_latest_frame?'latest':'fifo';
+ui.resolution.value=`${s.width}x${s.height}`}
+async function refresh(){try{ui.status.textContent=statusLine(await getState())}catch(e){ui.status.textContent=`error: ${e.message}`}}
+for (const id of ['strength','blend']) ui[id].oninput=()=>ui[id+'v'].textContent=(+ui[id].value).toFixed(2);
+ui.apply.onclick=async()=>{let [w,h]=ui.resolution.value.split('x').map(Number);await fetch('/api/state',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:ui.prompt.value,seed:+ui.seed.value,strength:+ui.strength.value,steps:+ui.steps.value,blend:+ui.blend.value,passthrough:ui.passthrough.checked,use_latest_frame:ui.frame_mode.value==='latest',width:w||1024,height:h||1024})});fill(await getState())}
+setInterval(refresh,1000);
+getState().then(fill).catch(e=>{ui.status.textContent=`error: ${e.message}`});
 </script></body></html>)HTML";
 }
 
