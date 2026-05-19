@@ -35,6 +35,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cmath>
+#include <cctype>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -111,6 +112,7 @@ struct Args {
     std::string capture_backend = "v4l2";
     std::string display_backend = "gl";
     std::string gl_sync = "vsync";
+    std::string nvidia_full_composition = "auto";
     std::string python = ".venv/bin/python";
     int capture_width = 1920;
     int capture_height = 1080;
@@ -203,6 +205,132 @@ std::string shell_quote(const std::string& value) {
     return out;
 }
 
+std::string trim_copy(const std::string& value) {
+    size_t first = 0;
+    while (first < value.size() && std::isspace(static_cast<unsigned char>(value[first]))) ++first;
+    size_t last = value.size();
+    while (last > first && std::isspace(static_cast<unsigned char>(value[last - 1]))) --last;
+    return value.substr(first, last - first);
+}
+
+bool starts_with(const std::string& value, const std::string& prefix) {
+    return value.size() >= prefix.size() && value.compare(0, prefix.size(), prefix) == 0;
+}
+
+std::string capture_command_output(const std::string& command) {
+    FILE* pipe = popen(command.c_str(), "r");
+    if (!pipe) return {};
+    std::string output;
+    char buffer[4096];
+    while (fgets(buffer, sizeof(buffer), pipe)) output += buffer;
+    pclose(pipe);
+    return output;
+}
+
+std::string extract_nvidia_metamode(const std::string& output) {
+    size_t marker = output.rfind(" :: ");
+    if (marker == std::string::npos) return {};
+    std::string mode = output.substr(marker + 4);
+    size_t newline = mode.find('\n');
+    if (newline != std::string::npos) mode.resize(newline);
+    return trim_copy(mode);
+}
+
+std::vector<std::string> split_comma_list(const std::string& value) {
+    std::vector<std::string> items;
+    std::stringstream stream(value);
+    std::string item;
+    while (std::getline(stream, item, ',')) {
+        item = trim_copy(item);
+        if (!item.empty()) items.push_back(item);
+    }
+    return items;
+}
+
+std::string join_comma_list(const std::vector<std::string>& items) {
+    std::ostringstream out;
+    for (size_t i = 0; i < items.size(); ++i) {
+        if (i > 0) out << ", ";
+        out << items[i];
+    }
+    return out.str();
+}
+
+bool is_nvidia_composition_token(const std::string& token) {
+    std::string trimmed = trim_copy(token);
+    return starts_with(trimmed, "ForceCompositionPipeline=") ||
+           starts_with(trimmed, "ForceFullCompositionPipeline=");
+}
+
+std::string add_full_composition_flags_to_body(const std::string& body) {
+    std::vector<std::string> items;
+    for (const std::string& item : split_comma_list(body)) {
+        if (!is_nvidia_composition_token(item)) items.push_back(item);
+    }
+    items.push_back("ForceCompositionPipeline=On");
+    items.push_back("ForceFullCompositionPipeline=On");
+    return join_comma_list(items);
+}
+
+std::string add_full_composition_to_metamode(const std::string& mode) {
+    std::string out;
+    size_t pos = 0;
+    bool patched = false;
+    while (true) {
+        size_t open = mode.find('{', pos);
+        if (open == std::string::npos) break;
+        size_t close = mode.find('}', open + 1);
+        if (close == std::string::npos) break;
+        out.append(mode, pos, open - pos + 1);
+        out += add_full_composition_flags_to_body(mode.substr(open + 1, close - open - 1));
+        out += "}";
+        pos = close + 1;
+        patched = true;
+    }
+    out.append(mode, pos, std::string::npos);
+    if (patched) return out;
+    return mode + " { ForceCompositionPipeline=On, ForceFullCompositionPipeline=On }";
+}
+
+bool should_apply_nvidia_full_composition(const Args& args) {
+    if (args.nvidia_full_composition == "off") return false;
+    if (args.nvidia_full_composition == "on") return true;
+    return args.display_backend == "gl" && args.gl_sync != "off" && !args.no_display;
+}
+
+void maybe_enable_nvidia_full_composition(const Args& args) {
+    if (!should_apply_nvidia_full_composition(args)) return;
+    const char* display = std::getenv("DISPLAY");
+    if (!display || std::string(display).empty()) {
+        if (args.nvidia_full_composition == "on") {
+            std::cerr << "display: NVIDIA full composition requested but DISPLAY is not set\n";
+        }
+        return;
+    }
+
+    std::string output = capture_command_output("nvidia-settings -q CurrentMetaMode 2>/dev/null");
+    std::string mode = extract_nvidia_metamode(output);
+    if (mode.empty()) {
+        std::cerr << "display: NVIDIA full composition unavailable; nvidia-settings CurrentMetaMode not readable\n";
+        return;
+    }
+    if (mode.find("ForceFullCompositionPipeline=On") != std::string::npos) {
+        std::cerr << "display: NVIDIA ForceFullCompositionPipeline already enabled\n";
+        return;
+    }
+
+    std::string patched = add_full_composition_to_metamode(mode);
+    std::string command = "nvidia-settings --assign " +
+                          shell_quote("CurrentMetaMode=" + patched) +
+                          " >/dev/null 2>&1";
+    int rc = std::system(command.c_str());
+    if (rc == 0) {
+        std::cerr << "display: enabled NVIDIA ForceFullCompositionPipeline\n";
+    } else {
+        std::cerr << "display: enabling NVIDIA ForceFullCompositionPipeline failed\n";
+    }
+}
+
 std::string current_working_directory() {
     char buf[4096];
     if (!getcwd(buf, sizeof(buf))) return ".";
@@ -280,6 +408,7 @@ Args parse_args(int argc, char** argv) {
         else if (key == "--capture-backend") args.capture_backend = val("--capture-backend");
         else if (key == "--display-backend") args.display_backend = val("--display-backend");
         else if (key == "--gl-sync") args.gl_sync = val("--gl-sync");
+        else if (key == "--nvidia-full-composition") args.nvidia_full_composition = val("--nvidia-full-composition");
         else if (key == "--python") args.python = val("--python");
         else if (key == "--capture-width") args.capture_width = std::stoi(val("--capture-width"));
         else if (key == "--capture-height") args.capture_height = std::stoi(val("--capture-height"));
@@ -314,7 +443,8 @@ Args parse_args(int argc, char** argv) {
                 << "       [--engine-dir onnx] [--asset-dir cpp_assets] [--web-root web]\n"
                 << "       [--conditioning-backend worker|script] [--conditioning-script conditioning_worker.py]\n"
                 << "       [--capture-backend v4l2|ffmpeg] [--display-backend gl|ffplay|none]\n"
-                << "       [--gl-sync vsync|off] [--http-port 8080] [--osc-port 9000] [--no-display]\n"
+                << "       [--gl-sync off|vsync|strict] [--nvidia-full-composition auto|on|off]\n"
+                << "       [--http-port 8080] [--osc-port 9000] [--no-display]\n"
                 << "       [--realtime] [--lock-memory] [--rt-priority N]\n"
                 << "       [--main-core N] [--capture-core N] [--http-core N]\n";
             std::exit(0);
@@ -328,8 +458,13 @@ Args parse_args(int argc, char** argv) {
     if (args.display_backend != "gl" && args.display_backend != "ffplay" && args.display_backend != "none") {
         throw std::runtime_error("--display-backend must be gl, ffplay, or none");
     }
-    if (args.gl_sync != "vsync" && args.gl_sync != "off") {
-        throw std::runtime_error("--gl-sync must be vsync or off");
+    if (args.gl_sync != "vsync" && args.gl_sync != "off" && args.gl_sync != "strict") {
+        throw std::runtime_error("--gl-sync must be off, vsync, or strict");
+    }
+    if (args.nvidia_full_composition != "auto" &&
+        args.nvidia_full_composition != "on" &&
+        args.nvidia_full_composition != "off") {
+        throw std::runtime_error("--nvidia-full-composition must be auto, on, or off");
     }
     if (args.conditioning_backend != "worker" && args.conditioning_backend != "script") {
         throw std::runtime_error("--conditioning-backend must be worker or script");
@@ -1024,20 +1159,23 @@ class GlDisplay {
     void configure_swap_sync() {
         int interval = sync_mode_ == "off" ? 0 : 1;
         bool ok = set_swap_interval(interval);
-        if (sync_mode_ != "off") {
+        if (sync_mode_ == "strict") {
             get_video_sync_ = reinterpret_cast<GlXGetVideoSyncSgiFn>(
                 glXGetProcAddressARB(reinterpret_cast<const GLubyte*>("glXGetVideoSyncSGI")));
             wait_video_sync_ = reinterpret_cast<GlXWaitVideoSyncSgiFn>(
                 glXGetProcAddressARB(reinterpret_cast<const GLubyte*>("glXWaitVideoSyncSGI")));
         }
+        const char* video_sync_status = sync_mode_ == "strict"
+            ? (wait_video_sync_ ? "available" : "unavailable")
+            : "disabled";
         std::cerr << "display: gl swap sync " << sync_mode_
                   << " interval " << interval
-                  << " video_sync " << (wait_video_sync_ ? "available" : "unavailable")
+                  << " video_sync " << video_sync_status
                   << (ok ? "" : " (not supported by GLX)") << "\n";
     }
 
     void wait_for_vblank() {
-        if (sync_mode_ == "off" || !get_video_sync_ || !wait_video_sync_) return;
+        if (sync_mode_ != "strict" || !get_video_sync_ || !wait_video_sync_) return;
         unsigned int count = 0;
         if (get_video_sync_(&count) != 0) return;
         wait_video_sync_(2, static_cast<int>((count + 1) % 2), &count);
@@ -2154,6 +2292,7 @@ bool reexec_if_requested(const Args& args) {
     append_arg(argv, "--capture-backend", args.capture_backend);
     append_arg(argv, "--display-backend", args.display_backend);
     append_arg(argv, "--gl-sync", args.gl_sync);
+    append_arg(argv, "--nvidia-full-composition", args.nvidia_full_composition);
     append_arg(argv, "--python", args.python);
     append_arg(argv, "--capture-width", std::to_string(args.capture_width));
     append_arg(argv, "--capture-height", std::to_string(args.capture_height));
@@ -2272,6 +2411,7 @@ int main(int argc, char** argv) {
         signal(SIGINT, on_signal);
         signal(SIGTERM, on_signal);
         configure_current_thread("main-frame", args.main_core, args.rt_priority);
+        maybe_enable_nvidia_full_composition(args);
         CHECK_CUDA(cudaSetDevice(0));
         Logger logger;
         initLibNvInferPlugins(&logger, "");

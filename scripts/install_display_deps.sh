@@ -26,7 +26,8 @@ apt-get install -y \
   libglew-dev \
   libglfw3-dev \
   libdrm-dev \
-  libgbm-dev
+  libgbm-dev \
+  nvidia-settings
 
 echo "Display development dependencies installed."
 echo "You should now have X11/OpenGL/EGL headers for the CUDA display backend work."

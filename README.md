@@ -133,6 +133,7 @@ Fullscreen webcam app:
   --camera-fps 30 \
   --conditioning-backend worker \
   --gl-sync vsync \
+  --nvidia-full-composition auto \
   --http-port 8080 \
   --osc-port 9000
 ```
@@ -253,11 +254,21 @@ Implemented low-level latency controls:
 
 The default display backend is `gl`, implemented with GLX, an OpenGL pixel
 buffer object, and CUDA graphics interop. It defaults to `--gl-sync vsync` to
-avoid visible tearing at scanout. In vsync mode the app also requests compositor
-bypass for the fullscreen X11 window and uses `GLX_SGI_video_sync` when the
-driver exposes it. Use `--gl-sync off` for the lowest presentation latency when
-tearing is acceptable. Use `--display-backend ffplay` as a fallback if X11/OpenGL
-is unavailable.
+avoid visible tearing at scanout. With the default
+`--nvidia-full-composition auto`, NVIDIA/X11 displays also get
+`ForceFullCompositionPipeline=On` applied through `nvidia-settings` when
+available; this fixed scanout tearing on the 5090 test machine. The GL sync modes
+are:
+
+* `--gl-sync off`: lowest presentation latency; tearing is possible.
+* `--gl-sync vsync`: normal GL swap-interval pacing, the default.
+* `--gl-sync strict`: swap interval plus an explicit `GLX_SGI_video_sync` wait
+  before swap; use only if `vsync` still tears.
+
+Use `--nvidia-full-composition off` to leave the NVIDIA MetaMode untouched, or
+`--nvidia-full-composition on` to require the composition setting even with
+`--gl-sync off`. Use `--display-backend ffplay` as a fallback if X11/OpenGL is
+unavailable.
 
 ## Resolution Notes
 
