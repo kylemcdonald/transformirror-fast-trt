@@ -48,6 +48,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -109,6 +110,7 @@ struct Args {
     std::string camera_device = "/dev/video0";
     std::string capture_backend = "v4l2";
     std::string display_backend = "gl";
+    std::string gl_sync = "vsync";
     std::string python = ".venv/bin/python";
     int capture_width = 1920;
     int capture_height = 1080;
@@ -152,6 +154,7 @@ struct AppState {
     int height = kHeight;
     int http_port = 8080;
     int osc_port = 9000;
+    std::string display_sync = "vsync";
     int camera_source_width = 0;
     int camera_source_height = 0;
     int camera_crop_width = kWidth;
@@ -276,6 +279,7 @@ Args parse_args(int argc, char** argv) {
         else if (key == "--camera-device") args.camera_device = val("--camera-device");
         else if (key == "--capture-backend") args.capture_backend = val("--capture-backend");
         else if (key == "--display-backend") args.display_backend = val("--display-backend");
+        else if (key == "--gl-sync") args.gl_sync = val("--gl-sync");
         else if (key == "--python") args.python = val("--python");
         else if (key == "--capture-width") args.capture_width = std::stoi(val("--capture-width"));
         else if (key == "--capture-height") args.capture_height = std::stoi(val("--capture-height"));
@@ -310,7 +314,7 @@ Args parse_args(int argc, char** argv) {
                 << "       [--engine-dir onnx] [--asset-dir cpp_assets] [--web-root web]\n"
                 << "       [--conditioning-backend worker|script] [--conditioning-script conditioning_worker.py]\n"
                 << "       [--capture-backend v4l2|ffmpeg] [--display-backend gl|ffplay|none]\n"
-                << "       [--http-port 8080] [--osc-port 9000] [--no-display]\n"
+                << "       [--gl-sync vsync|off] [--http-port 8080] [--osc-port 9000] [--no-display]\n"
                 << "       [--realtime] [--lock-memory] [--rt-priority N]\n"
                 << "       [--main-core N] [--capture-core N] [--http-core N]\n";
             std::exit(0);
@@ -323,6 +327,9 @@ Args parse_args(int argc, char** argv) {
     }
     if (args.display_backend != "gl" && args.display_backend != "ffplay" && args.display_backend != "none") {
         throw std::runtime_error("--display-backend must be gl, ffplay, or none");
+    }
+    if (args.gl_sync != "vsync" && args.gl_sync != "off") {
+        throw std::runtime_error("--gl-sync must be vsync or off");
     }
     if (args.conditioning_backend != "worker" && args.conditioning_backend != "script") {
         throw std::runtime_error("--conditioning-backend must be worker or script");
@@ -825,7 +832,8 @@ std::string ffplay_display_cmd() {
 
 class GlDisplay {
   public:
-    explicit GlDisplay(size_t rgb_bytes) : rgb_bytes_(rgb_bytes) {
+    explicit GlDisplay(size_t rgb_bytes, std::string sync_mode)
+        : rgb_bytes_(rgb_bytes), sync_mode_(std::move(sync_mode)) {
         open_display();
         create_window();
         create_gl_objects();
@@ -964,7 +972,7 @@ class GlDisplay {
         if (glew_status != GLEW_OK) {
             throw std::runtime_error(std::string("GLEW init failed: ") + reinterpret_cast<const char*>(glewGetErrorString(glew_status)));
         }
-        disable_vsync();
+        configure_swap_sync();
 
         glDisable(GL_DEPTH_TEST);
         glDisable(GL_CULL_FACE);
@@ -987,19 +995,27 @@ class GlDisplay {
         if (err != GL_NO_ERROR) throw std::runtime_error("OpenGL setup failed with error " + std::to_string(err));
     }
 
-    void disable_vsync() {
+    bool set_swap_interval(int interval) {
         auto* ext = reinterpret_cast<GlXSwapIntervalExtFn>(glXGetProcAddressARB(reinterpret_cast<const GLubyte*>("glXSwapIntervalEXT")));
         if (ext) {
-            ext(display_, window_, 0);
-            return;
+            ext(display_, window_, interval);
+            return true;
         }
         auto* mesa = reinterpret_cast<GlXSwapIntervalMesaFn>(glXGetProcAddressARB(reinterpret_cast<const GLubyte*>("glXSwapIntervalMESA")));
         if (mesa) {
-            mesa(0);
-            return;
+            return mesa(static_cast<unsigned int>(interval)) == 0;
         }
         auto* sgi = reinterpret_cast<GlXSwapIntervalSgiFn>(glXGetProcAddressARB(reinterpret_cast<const GLubyte*>("glXSwapIntervalSGI")));
-        if (sgi) sgi(0);
+        if (sgi && interval > 0) return sgi(interval) == 0;
+        return false;
+    }
+
+    void configure_swap_sync() {
+        int interval = sync_mode_ == "off" ? 0 : 1;
+        bool ok = set_swap_interval(interval);
+        std::cerr << "display: gl swap sync " << sync_mode_
+                  << " interval " << interval
+                  << (ok ? "" : " (not supported by GLX)") << "\n";
     }
 
     void register_cuda_pbo() {
@@ -1024,6 +1040,7 @@ class GlDisplay {
     }
 
     size_t rgb_bytes_ = 0;
+    std::string sync_mode_;
     Display* display_ = nullptr;
     int screen_ = 0;
     int window_width_ = kWidth;
@@ -1509,6 +1526,7 @@ std::string state_json() {
         << "\"requested_width\":" << g_state.requested_width << ","
         << "\"requested_height\":" << g_state.requested_height << ","
         << "\"cached_resolutions\":" << cached_resolutions << ","
+        << "\"display_sync\":\"" << json_escape(g_state.display_sync) << "\","
         << "\"http_port\":" << g_state.http_port << ","
         << "\"osc_port\":" << g_state.osc_port
         << "},"
@@ -2108,6 +2126,7 @@ bool reexec_if_requested(const Args& args) {
     append_arg(argv, "--camera-device", args.camera_device);
     append_arg(argv, "--capture-backend", args.capture_backend);
     append_arg(argv, "--display-backend", args.display_backend);
+    append_arg(argv, "--gl-sync", args.gl_sync);
     append_arg(argv, "--python", args.python);
     append_arg(argv, "--capture-width", std::to_string(args.capture_width));
     append_arg(argv, "--capture-height", std::to_string(args.capture_height));
@@ -2236,6 +2255,7 @@ int main(int argc, char** argv) {
             std::lock_guard<std::mutex> lock(g_state_mutex);
             g_state.http_port = args.http_port;
             g_state.osc_port = args.osc_port;
+            g_state.display_sync = args.gl_sync;
             g_state.camera_source_width = args.capture_width;
             g_state.camera_source_height = args.capture_height;
             g_state.camera_fps = args.camera_fps;
@@ -2288,7 +2308,7 @@ int main(int argc, char** argv) {
             display = popen(display_cmd.c_str(), "w");
             if (!display) throw std::runtime_error("failed to start ffplay display");
         } else if (args.display_backend == "gl") {
-            gl_display.reset(new GlDisplay(pipeline.rgb_bytes()));
+            gl_display.reset(new GlDisplay(pipeline.rgb_bytes(), args.gl_sync));
             std::lock_guard<std::mutex> lock(g_state_mutex);
             g_state.display_width = gl_display->width();
             g_state.display_height = gl_display->height();

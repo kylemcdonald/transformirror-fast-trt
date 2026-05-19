@@ -132,6 +132,7 @@ Fullscreen webcam app:
   --capture-height 1080 \
   --camera-fps 30 \
   --conditioning-backend worker \
+  --gl-sync vsync \
   --http-port 8080 \
   --osc-port 9000
 ```
@@ -251,8 +252,10 @@ Implemented low-level latency controls:
 * GPU clock lock/reset helper script
 
 The default display backend is `gl`, implemented with GLX, an OpenGL pixel
-buffer object, and CUDA graphics interop. Use `--display-backend ffplay` as a
-fallback if X11/OpenGL is unavailable.
+buffer object, and CUDA graphics interop. It defaults to `--gl-sync vsync` to
+avoid visible tearing at scanout. Use `--gl-sync off` for the lowest presentation
+latency when tearing is acceptable. Use `--display-backend ffplay` as a fallback
+if X11/OpenGL is unavailable.
 
 ## Resolution Notes
 
