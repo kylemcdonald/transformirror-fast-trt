@@ -14,6 +14,8 @@ from diffusers.utils.logging import disable_progress_bar
 
 from fastest_sdxl_turbo_img2img import PROMPT
 
+MAX_DENOISE_STEPS = 8
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -130,12 +132,16 @@ class ConditioningGenerator:
         scheduler_started = time.perf_counter()
         self.pipe.scheduler.set_timesteps(steps, device=self.device)
         timesteps, effective_steps = self.pipe.get_timesteps(steps, strength, self.device)
-        if len(timesteps) != 1:
-            raise ValueError(f"this fast path expects one effective denoise step, got {len(timesteps)}")
-        sigma = self.pipe.scheduler.sigmas[self.pipe.scheduler.begin_index].to(
-            device=self.device, dtype=torch.float32
-        )
-        sigma_scale = torch.sqrt(sigma * sigma + 1.0)
+        if len(timesteps) < 1:
+            raise ValueError(f"this fast path expects at least one effective denoise step, got {len(timesteps)}")
+        if len(timesteps) > MAX_DENOISE_STEPS:
+            raise ValueError(f"this fast path supports at most {MAX_DENOISE_STEPS} effective denoise steps, got {len(timesteps)}")
+        sigmas = self.pipe.scheduler.sigmas[
+            self.pipe.scheduler.begin_index : self.pipe.scheduler.begin_index + len(timesteps) + 1
+        ].to(device=self.device, dtype=torch.float32)
+        sigma_scales = torch.sqrt(sigmas[:-1] * sigmas[:-1] + 1.0)
+        inv_sigma_scales = torch.reciprocal(sigma_scales)
+        step_params = torch.stack((sigmas[:-1], sigmas[1:], inv_sigma_scales), dim=1).contiguous()
 
         projection_dim = (
             int(pooled_prompt_embeds.shape[-1])
@@ -164,6 +170,7 @@ class ConditioningGenerator:
             dtype=torch.float16,
         )
         timestep = timesteps[:1].to(device=self.device, dtype=torch.float32)
+        timesteps_f32 = timesteps.to(device=self.device, dtype=torch.float32).contiguous()
         torch.cuda.synchronize()
         scheduler_ms = (time.perf_counter() - scheduler_started) * 1000.0
 
@@ -176,10 +183,17 @@ class ConditioningGenerator:
             save_tensor(out_dir / "text_embeds.fp16", pooled_prompt_embeds)
             save_tensor(out_dir / "time_ids.fp16", time_ids)
             save_tensor(out_dir / "timestep.f32", timestep)
+            timesteps_array = np.zeros((MAX_DENOISE_STEPS,), dtype=np.float32)
+            timesteps_array[: len(timesteps)] = timesteps_f32.detach().cpu().numpy()
+            step_params_array = np.zeros((MAX_DENOISE_STEPS, 3), dtype=np.float32)
+            step_params_array[: len(timesteps), :] = step_params.detach().cpu().numpy()
+            write_bytes_atomic(out_dir / "timesteps.f32", timesteps_array.tobytes())
+            write_bytes_atomic(out_dir / "step_params.f32", step_params_array.tobytes())
+            write_bytes_atomic(out_dir / "step_count.i32", np.asarray([len(timesteps)], dtype=np.int32).tobytes())
             params = np.asarray(
                 [
-                    float(sigma.detach().cpu()),
-                    float(1.0 / sigma_scale.detach().cpu()),
+                    float(sigmas[0].detach().cpu()),
+                    float(inv_sigma_scales[0].detach().cpu()),
                     float(self.pipe.vae.config.scaling_factor),
                     float(1.0 / self.pipe.vae.config.scaling_factor),
                 ],
@@ -197,8 +211,8 @@ class ConditioningGenerator:
             "seed": seed,
             "effective_steps": int(effective_steps),
             "timesteps": [float(t.detach().cpu()) for t in timesteps],
-            "sigma": float(sigma.detach().cpu()),
-            "sigma_scale": float(sigma_scale.detach().cpu()),
+            "sigmas": [float(s.detach().cpu()) for s in sigmas],
+            "step_params": step_params.detach().cpu().numpy().tolist(),
             "scaling_factor": float(self.pipe.vae.config.scaling_factor),
             "cache_hit": cache_hit,
             "load_ms": self.load_ms,
@@ -231,6 +245,14 @@ def parent_is_alive(parent_pid):
         return True
 
 
+def socket_path_matches(path, owner_stat):
+    try:
+        current = path.stat()
+    except FileNotFoundError:
+        return False
+    return current.st_dev == owner_stat.st_dev and current.st_ino == owner_stat.st_ino
+
+
 def recv_json_line(conn):
     chunks = []
     while True:
@@ -259,6 +281,7 @@ def main():
     server.settimeout(0.5)
     server.bind(str(args.socket))
     server.listen(8)
+    socket_owner = args.socket.stat()
     print(
         json.dumps(
             {
@@ -276,6 +299,8 @@ def main():
     try:
         while parent_is_alive(args.parent_pid):
             if args.idle_exit_sec > 0 and time.monotonic() - last_request > args.idle_exit_sec:
+                break
+            if not socket_path_matches(args.socket, socket_owner):
                 break
             try:
                 conn, _ = server.accept()

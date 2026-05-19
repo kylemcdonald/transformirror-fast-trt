@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 
 cpp/build/
+cpp/build_*/
 onnx/
 onnx_full/
 cpp_assets/

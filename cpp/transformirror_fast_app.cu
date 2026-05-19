@@ -51,17 +51,27 @@
 
 namespace {
 
-constexpr int kWidth = 1024;
-constexpr int kHeight = 1024;
-constexpr int kSupportedSteps = 2;
+#ifndef TRANSFORMIRROR_WIDTH
+#define TRANSFORMIRROR_WIDTH 1024
+#endif
+#ifndef TRANSFORMIRROR_HEIGHT
+#define TRANSFORMIRROR_HEIGHT 1024
+#endif
+
+constexpr int kWidth = TRANSFORMIRROR_WIDTH;
+constexpr int kHeight = TRANSFORMIRROR_HEIGHT;
+constexpr int kMaxDenoiseSteps = 8;
 constexpr int kImageElems = 1 * 3 * kHeight * kWidth;
 constexpr int kRgbElems = kHeight * kWidth * 3;
-constexpr int kLatentElems = 1 * 4 * 128 * 128;
+constexpr int kLatentWidth = kWidth / 8;
+constexpr int kLatentHeight = kHeight / 8;
+constexpr int kLatentElems = 1 * 4 * kLatentHeight * kLatentWidth;
 constexpr int kPromptElems = 1 * 77 * 2048;
 constexpr int kTextElems = 1 * 1280;
 constexpr int kTimeElems = 1 * 6;
 constexpr int kTimestepElems = 1;
 constexpr int kParamElems = 4;  // sigma, inv_sigma_scale, scaling, inv_scaling
+constexpr int kStepParamElems = kMaxDenoiseSteps * 3;  // sigma, next_sigma, inv_sigma_scale
 
 #define CHECK_CUDA(expr)                                                        \
     do {                                                                        \
@@ -113,6 +123,20 @@ struct Args {
     int rt_priority = 0;
     bool lock_memory = false;
     bool no_display = false;
+    bool has_initial_prompt = false;
+    bool has_initial_seed = false;
+    bool has_initial_strength = false;
+    bool has_initial_steps = false;
+    bool has_initial_blend = false;
+    bool has_initial_passthrough = false;
+    bool has_initial_use_latest_frame = false;
+    std::string initial_prompt;
+    int initial_seed = 0;
+    float initial_strength = 0.7f;
+    int initial_steps = 2;
+    float initial_blend = 1.0f;
+    bool initial_passthrough = false;
+    bool initial_use_latest_frame = true;
 };
 
 struct AppState {
@@ -144,11 +168,21 @@ struct AppState {
     uint64_t dropped_frames = 0;
     std::string status = "starting";
     bool reload_requested = false;
+    bool resolution_rebuild_requested = false;
+    bool resolution_rebuild_active = false;
+    int requested_width = kWidth;
+    int requested_height = kHeight;
 };
 
 std::mutex g_state_mutex;
 std::condition_variable g_reload_cv;
+std::condition_variable g_resolution_cv;
 AppState g_state;
+std::atomic<bool> g_reexec_requested{false};
+std::mutex g_reexec_mutex;
+std::string g_reexec_binary;
+std::string g_reexec_engine_dir;
+std::string g_reexec_asset_dir;
 
 std::string join_path(const std::string& a, const std::string& b) {
     if (a.empty() || a.back() == '/') return a + b;
@@ -169,6 +203,16 @@ std::string current_working_directory() {
     char buf[4096];
     if (!getcwd(buf, sizeof(buf))) return ".";
     return std::string(buf);
+}
+
+int normalized_resolution(int value) {
+    int rounded = static_cast<int>(std::lround(static_cast<double>(value) / 32.0) * 32.0);
+    return std::clamp(rounded, 256, 1280);
+}
+
+void set_close_on_exec(int fd) {
+    int flags = fcntl(fd, F_GETFD);
+    if (flags >= 0) fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
 }
 
 void warn_errno(const std::string& what) {
@@ -244,6 +288,13 @@ Args parse_args(int argc, char** argv) {
         else if (key == "--osc-core") args.osc_core = std::stoi(val("--osc-core"));
         else if (key == "--reload-core") args.reload_core = std::stoi(val("--reload-core"));
         else if (key == "--rt-priority") args.rt_priority = std::stoi(val("--rt-priority"));
+        else if (key == "--initial-prompt") { args.initial_prompt = val("--initial-prompt"); args.has_initial_prompt = true; }
+        else if (key == "--initial-seed") { args.initial_seed = std::stoi(val("--initial-seed")); args.has_initial_seed = true; }
+        else if (key == "--initial-strength") { args.initial_strength = std::stof(val("--initial-strength")); args.has_initial_strength = true; }
+        else if (key == "--initial-steps") { args.initial_steps = std::stoi(val("--initial-steps")); args.has_initial_steps = true; }
+        else if (key == "--initial-blend") { args.initial_blend = std::stof(val("--initial-blend")); args.has_initial_blend = true; }
+        else if (key == "--initial-passthrough") { args.initial_passthrough = std::stoi(val("--initial-passthrough")) != 0; args.has_initial_passthrough = true; }
+        else if (key == "--initial-use-latest-frame") { args.initial_use_latest_frame = std::stoi(val("--initial-use-latest-frame")) != 0; args.has_initial_use_latest_frame = true; }
         else if (key == "--lock-memory") args.lock_memory = true;
         else if (key == "--realtime") {
             args.lock_memory = true;
@@ -282,6 +333,17 @@ Args parse_args(int argc, char** argv) {
     if (args.rt_priority < 0) args.rt_priority = 0;
     if (args.rt_priority > 95) args.rt_priority = 95;
     return args;
+}
+
+void apply_initial_state(const Args& args) {
+    std::lock_guard<std::mutex> lock(g_state_mutex);
+    if (args.has_initial_prompt) g_state.prompt = args.initial_prompt;
+    if (args.has_initial_seed) g_state.seed = args.initial_seed;
+    if (args.has_initial_strength) g_state.strength = std::clamp(args.initial_strength, 0.0f, 1.0f);
+    if (args.has_initial_steps) g_state.steps = std::clamp(args.initial_steps, 2, 8);
+    if (args.has_initial_blend) g_state.blend = std::clamp(args.initial_blend, 0.0f, 1.0f);
+    if (args.has_initial_passthrough) g_state.passthrough = args.initial_passthrough;
+    if (args.has_initial_use_latest_frame) g_state.use_latest_frame = args.initial_use_latest_frame;
 }
 
 std::vector<char> read_file(const std::string& path) {
@@ -345,6 +407,9 @@ struct AssetBlob {
     std::vector<char> time;
     std::vector<char> timestep;
     std::vector<char> params;
+    std::vector<char> timesteps;
+    std::vector<char> step_params;
+    std::vector<char> step_count;
 };
 
 std::vector<char> read_exact_asset(const std::string& path, size_t bytes) {
@@ -356,6 +421,10 @@ std::vector<char> read_exact_asset(const std::string& path, size_t bytes) {
     return data;
 }
 
+bool file_exists(const std::string& path) {
+    return access(path.c_str(), F_OK) == 0;
+}
+
 AssetBlob read_asset_blob(const std::string& asset_dir) {
     AssetBlob assets;
     assets.noise = read_exact_asset(join_path(asset_dir, "noise.fp16"), kLatentElems * sizeof(__half));
@@ -364,6 +433,25 @@ AssetBlob read_asset_blob(const std::string& asset_dir) {
     assets.time = read_exact_asset(join_path(asset_dir, "time_ids.fp16"), kTimeElems * sizeof(__half));
     assets.timestep = read_exact_asset(join_path(asset_dir, "timestep.f32"), kTimestepElems * sizeof(float));
     assets.params = read_exact_asset(join_path(asset_dir, "params.f32"), kParamElems * sizeof(float));
+    std::string timesteps_path = join_path(asset_dir, "timesteps.f32");
+    std::string step_params_path = join_path(asset_dir, "step_params.f32");
+    std::string step_count_path = join_path(asset_dir, "step_count.i32");
+    if (file_exists(timesteps_path) && file_exists(step_params_path) && file_exists(step_count_path)) {
+        assets.timesteps = read_exact_asset(timesteps_path, kMaxDenoiseSteps * sizeof(float));
+        assets.step_params = read_exact_asset(step_params_path, kStepParamElems * sizeof(float));
+        assets.step_count = read_exact_asset(step_count_path, sizeof(int32_t));
+    } else {
+        assets.timesteps.assign(kMaxDenoiseSteps * sizeof(float), 0);
+        assets.step_params.assign(kStepParamElems * sizeof(float), 0);
+        assets.step_count.assign(sizeof(int32_t), 0);
+        std::memcpy(assets.timesteps.data(), assets.timestep.data(), sizeof(float));
+        float params[kParamElems] = {};
+        std::memcpy(params, assets.params.data(), sizeof(params));
+        float step_params[3] = {params[0], 0.0f, params[1]};
+        std::memcpy(assets.step_params.data(), step_params, sizeof(step_params));
+        int32_t count = 1;
+        std::memcpy(assets.step_count.data(), &count, sizeof(count));
+    }
     return assets;
 }
 
@@ -402,28 +490,42 @@ __global__ void preprocess_rgb_kernel(const uint8_t* rgb, __half* image, int n_p
     image[2 * n_pixels + idx] = __float2half_rn(static_cast<float>(rgb[src + 2]) / 127.5f - 1.0f);
 }
 
-__global__ void prepare_unet_kernel(
-    const __half* encoded, const __half* noise, const float* params,
-    __half* latents, __half* unet_input, int n) {
+__global__ void init_latents_kernel(
+    const __half* encoded, const __half* noise, const float* step_params, const float* params,
+    __half* latents, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
-    float sigma = params[0];
-    float inv_sigma_scale = params[1];
+    float sigma = step_params[0];
     float scaling = params[2];
     float latent = __half2float(encoded[idx]) * scaling + __half2float(noise[idx]) * sigma;
     latents[idx] = __float2half_rn(latent);
-    unet_input[idx] = __float2half_rn(latent * inv_sigma_scale);
+}
+
+__global__ void prepare_model_input_kernel(
+    const __half* latents, const float* step_params, __half* unet_input, int step, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    float inv_sigma_scale = step_params[step * 3 + 2];
+    unet_input[idx] = __float2half_rn(__half2float(latents[idx]) * inv_sigma_scale);
+}
+
+__global__ void scheduler_step_kernel(
+    __half* latents, const __half* noise_pred, const float* step_params, int step, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    float sigma = step_params[step * 3];
+    float next_sigma = step_params[step * 3 + 1];
+    float latent = __half2float(latents[idx]) + (next_sigma - sigma) * __half2float(noise_pred[idx]);
+    latents[idx] = __float2half_rn(latent);
 }
 
 __global__ void prepare_decode_kernel(
-    const __half* latents, const __half* noise_pred, const float* params,
+    const __half* latents, const float* params,
     __half* decode_input, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
-    float sigma = params[0];
     float inv_scaling = params[3];
-    float latent = __half2float(latents[idx]) - sigma * __half2float(noise_pred[idx]);
-    decode_input[idx] = __float2half_rn(latent * inv_scaling);
+    decode_input[idx] = __float2half_rn(__half2float(latents[idx]) * inv_scaling);
 }
 
 __global__ void compose_rgb_kernel(
@@ -456,7 +558,8 @@ class FastPipeline {
           d_encoded_(kLatentElems), d_latents_(kLatentElems), d_unet_input_(kLatentElems),
           d_noise_pred_(kLatentElems), d_decode_input_(kLatentElems), d_decoded_(kImageElems),
           d_noise_(kLatentElems), d_prompt_(kPromptElems), d_text_(kTextElems), d_time_(kTimeElems),
-          d_timestep_(kTimestepElems), d_params_(kParamElems), d_blend_(1), d_passthrough_(1),
+          d_timestep_(kTimestepElems), d_timesteps_(kMaxDenoiseSteps),
+          d_params_(kParamElems), d_step_params_(kStepParamElems), d_blend_(1), d_passthrough_(1),
           h_src_rgb_(kRgbElems), h_dst_rgb_(kRgbElems) {
         CHECK_CUDA(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
         CHECK_CUDA(cudaEventCreate(&start_event_));
@@ -498,6 +601,13 @@ class FastPipeline {
         copy_asset(assets.time, d_time_.get(), d_time_.bytes());
         copy_asset(assets.timestep, d_timestep_.get(), d_timestep_.bytes());
         copy_asset(assets.params, d_params_.get(), d_params_.bytes());
+        copy_asset(assets.timesteps, d_timesteps_.get(), d_timesteps_.bytes());
+        copy_asset(assets.step_params, d_step_params_.get(), d_step_params_.bytes());
+        int32_t count = 1;
+        if (assets.step_count.size() == sizeof(int32_t)) {
+            std::memcpy(&count, assets.step_count.data(), sizeof(count));
+        }
+        step_count_ = std::clamp(static_cast<int>(count), 1, kMaxDenoiseSteps);
         CHECK_CUDA(cudaStreamSynchronize(stream_));
     }
 
@@ -507,7 +617,11 @@ class FastPipeline {
         CHECK_CUDA(cudaMemcpyAsync(d_src_rgb_.get(), h_src_rgb_.get(), h_src_rgb_.bytes(), cudaMemcpyHostToDevice, stream_));
         {
             std::lock_guard<std::mutex> lock(asset_mutex_);
-            CHECK_CUDA(cudaGraphLaunch(graph_exec_, stream_));
+            if (step_count_ == 1) {
+                CHECK_CUDA(cudaGraphLaunch(graph_exec_, stream_));
+            } else {
+                enqueue_dynamic_body(step_count_);
+            }
         }
         if (need_host_output) {
             CHECK_CUDA(cudaMemcpyAsync(h_dst_rgb_.get(), d_dst_rgb_.get(), h_dst_rgb_.bytes(), cudaMemcpyDeviceToHost, stream_));
@@ -548,11 +662,40 @@ class FastPipeline {
         constexpr int latent_grid = (kLatentElems + block - 1) / block;
         preprocess_rgb_kernel<<<pixel_grid, block, 0, stream_>>>(d_src_rgb_.get(), d_image_.get(), pixels);
         encode_.enqueue(stream_);
-        prepare_unet_kernel<<<latent_grid, block, 0, stream_>>>(
-            d_encoded_.get(), d_noise_.get(), d_params_.get(), d_latents_.get(), d_unet_input_.get(), kLatentElems);
+        init_latents_kernel<<<latent_grid, block, 0, stream_>>>(
+            d_encoded_.get(), d_noise_.get(), d_step_params_.get(), d_params_.get(), d_latents_.get(), kLatentElems);
+        prepare_model_input_kernel<<<latent_grid, block, 0, stream_>>>(
+            d_latents_.get(), d_step_params_.get(), d_unet_input_.get(), 0, kLatentElems);
+        CHECK_CUDA(cudaMemcpyAsync(d_timestep_.get(), d_timesteps_.get(), sizeof(float), cudaMemcpyDeviceToDevice, stream_));
         unet_.enqueue(stream_);
+        scheduler_step_kernel<<<latent_grid, block, 0, stream_>>>(
+            d_latents_.get(), d_noise_pred_.get(), d_step_params_.get(), 0, kLatentElems);
         prepare_decode_kernel<<<latent_grid, block, 0, stream_>>>(
-            d_latents_.get(), d_noise_pred_.get(), d_params_.get(), d_decode_input_.get(), kLatentElems);
+            d_latents_.get(), d_params_.get(), d_decode_input_.get(), kLatentElems);
+        decode_.enqueue(stream_);
+        compose_rgb_kernel<<<pixel_grid, block, 0, stream_>>>(
+            d_src_rgb_.get(), d_decoded_.get(), d_dst_rgb_.get(), d_blend_.get(), d_passthrough_.get(), pixels);
+    }
+
+    void enqueue_dynamic_body(int step_count) {
+        constexpr int block = 256;
+        constexpr int pixels = kWidth * kHeight;
+        constexpr int pixel_grid = (pixels + block - 1) / block;
+        constexpr int latent_grid = (kLatentElems + block - 1) / block;
+        preprocess_rgb_kernel<<<pixel_grid, block, 0, stream_>>>(d_src_rgb_.get(), d_image_.get(), pixels);
+        encode_.enqueue(stream_);
+        init_latents_kernel<<<latent_grid, block, 0, stream_>>>(
+            d_encoded_.get(), d_noise_.get(), d_step_params_.get(), d_params_.get(), d_latents_.get(), kLatentElems);
+        for (int step = 0; step < step_count; ++step) {
+            prepare_model_input_kernel<<<latent_grid, block, 0, stream_>>>(
+                d_latents_.get(), d_step_params_.get(), d_unet_input_.get(), step, kLatentElems);
+            CHECK_CUDA(cudaMemcpyAsync(d_timestep_.get(), d_timesteps_.get() + step, sizeof(float), cudaMemcpyDeviceToDevice, stream_));
+            unet_.enqueue(stream_);
+            scheduler_step_kernel<<<latent_grid, block, 0, stream_>>>(
+                d_latents_.get(), d_noise_pred_.get(), d_step_params_.get(), step, kLatentElems);
+        }
+        prepare_decode_kernel<<<latent_grid, block, 0, stream_>>>(
+            d_latents_.get(), d_params_.get(), d_decode_input_.get(), kLatentElems);
         decode_.enqueue(stream_);
         compose_rgb_kernel<<<pixel_grid, block, 0, stream_>>>(
             d_src_rgb_.get(), d_decoded_.get(), d_dst_rgb_.get(), d_blend_.get(), d_passthrough_.get(), pixels);
@@ -586,13 +729,14 @@ class FastPipeline {
     DeviceBuffer<uint8_t> d_src_rgb_, d_dst_rgb_;
     DeviceBuffer<__half> d_image_, d_encoded_, d_latents_, d_unet_input_, d_noise_pred_, d_decode_input_, d_decoded_;
     DeviceBuffer<__half> d_noise_, d_prompt_, d_text_, d_time_;
-    DeviceBuffer<float> d_timestep_, d_params_, d_blend_;
+    DeviceBuffer<float> d_timestep_, d_timesteps_, d_params_, d_step_params_, d_blend_;
     DeviceBuffer<uint8_t> d_passthrough_;
     PinnedBuffer<uint8_t> h_src_rgb_, h_dst_rgb_;
     cudaStream_t stream_ = nullptr;
     cudaGraphExec_t graph_exec_ = nullptr;
     cudaEvent_t start_event_ = nullptr;
     cudaEvent_t end_event_ = nullptr;
+    int step_count_ = 1;
     std::mutex asset_mutex_;
 };
 
@@ -603,7 +747,8 @@ std::string ffmpeg_capture_cmd(const Args& args) {
         << "-f v4l2 -thread_queue_size 1 -input_format mjpeg -video_size " << args.capture_width << "x" << args.capture_height
         << " -framerate " << args.camera_fps
         << " -i " << shell_quote(args.camera_device)
-        << " -vf 'crop=ih:ih:(iw-ih)/2:0,scale=" << kWidth << ":" << kHeight << "'"
+        << " -vf 'crop=min(iw\\,ih*" << kWidth << "/" << kHeight << "):min(ih\\,iw*" << kHeight << "/" << kWidth
+        << "):(iw-ow)/2:(ih-oh)/2,scale=" << kWidth << ":" << kHeight << "'"
         << " -pix_fmt rgb24 -f rawvideo -";
     return cmd.str();
 }
@@ -662,11 +807,13 @@ class GlDisplay {
         int viewport_y = 0;
         int viewport_w = window_width_;
         int viewport_h = window_height_;
-        if (window_width_ > window_height_) {
-            viewport_w = window_height_;
+        const double target_aspect = static_cast<double>(kWidth) / static_cast<double>(kHeight);
+        const double window_aspect = static_cast<double>(window_width_) / static_cast<double>(window_height_);
+        if (window_aspect > target_aspect) {
+            viewport_w = std::max(1, static_cast<int>(std::lround(window_height_ * target_aspect)));
             viewport_x = (window_width_ - viewport_w) / 2;
-        } else if (window_height_ > window_width_) {
-            viewport_h = window_width_;
+        } else if (window_aspect < target_aspect) {
+            viewport_h = std::max(1, static_cast<int>(std::lround(window_width_ / target_aspect)));
             viewport_y = (window_height_ - viewport_h) / 2;
         }
 
@@ -885,11 +1032,9 @@ class CaptureReader {
     }
 
     void stop() {
-        bool expected = true;
-        if (running_.compare_exchange_strong(expected, false)) {
-            cv_.notify_all();
-            if (thread_.joinable()) thread_.join();
-        }
+        running_.store(false);
+        cv_.notify_all();
+        if (thread_.joinable()) thread_.join();
     }
 
   private:
@@ -974,17 +1119,28 @@ bool decode_mjpeg_to_rgb(const uint8_t* data, size_t size, std::vector<uint8_t>&
 }
 
 void crop_resize_rgb_bilinear(const uint8_t* src, int src_w, int src_h, uint8_t* dst) {
-    const int crop = std::min(src_w, src_h);
-    const int x0 = (src_w - crop) / 2;
-    const int y0 = (src_h - crop) / 2;
-    const float scale = static_cast<float>(crop) / static_cast<float>(kWidth);
+    const double target_aspect = static_cast<double>(kWidth) / static_cast<double>(kHeight);
+    const double source_aspect = static_cast<double>(src_w) / static_cast<double>(src_h);
+    int crop_w = src_w;
+    int crop_h = src_h;
+    if (source_aspect > target_aspect) {
+        crop_w = std::max(1, static_cast<int>(std::lround(src_h * target_aspect)));
+    } else if (source_aspect < target_aspect) {
+        crop_h = std::max(1, static_cast<int>(std::lround(src_w / target_aspect)));
+    }
+    crop_w = std::min(crop_w, src_w);
+    crop_h = std::min(crop_h, src_h);
+    const int x0 = (src_w - crop_w) / 2;
+    const int y0 = (src_h - crop_h) / 2;
+    const float scale_x = static_cast<float>(crop_w) / static_cast<float>(kWidth);
+    const float scale_y = static_cast<float>(crop_h) / static_cast<float>(kHeight);
     for (int y = 0; y < kHeight; ++y) {
-        float fy = y0 + (static_cast<float>(y) + 0.5f) * scale - 0.5f;
+        float fy = y0 + (static_cast<float>(y) + 0.5f) * scale_y - 0.5f;
         int y1 = std::clamp(static_cast<int>(std::floor(fy)), 0, src_h - 1);
         int y2 = std::min(y1 + 1, src_h - 1);
         float wy = fy - static_cast<float>(y1);
         for (int x = 0; x < kWidth; ++x) {
-            float fx = x0 + (static_cast<float>(x) + 0.5f) * scale - 0.5f;
+            float fx = x0 + (static_cast<float>(x) + 0.5f) * scale_x - 0.5f;
             int x1 = std::clamp(static_cast<int>(std::floor(fx)), 0, src_w - 1);
             int x2 = std::min(x1 + 1, src_w - 1);
             float wx = fx - static_cast<float>(x1);
@@ -1041,11 +1197,9 @@ class V4L2CaptureReader {
     }
 
     void stop() {
-        bool expected = true;
-        if (running_.compare_exchange_strong(expected, false)) {
-            cv_.notify_all();
-            if (thread_.joinable()) thread_.join();
-        }
+        running_.store(false);
+        cv_.notify_all();
+        if (thread_.joinable()) thread_.join();
     }
 
   private:
@@ -1289,6 +1443,8 @@ std::string state_json() {
         << "\"config\":{"
         << "\"width\":" << g_state.width << ","
         << "\"height\":" << g_state.height << ","
+        << "\"requested_width\":" << g_state.requested_width << ","
+        << "\"requested_height\":" << g_state.requested_height << ","
         << "\"http_port\":" << g_state.http_port << ","
         << "\"osc_port\":" << g_state.osc_port
         << "},"
@@ -1313,7 +1469,7 @@ std::string state_json() {
         << "\"status\":{"
         << "\"camera_ready\":" << (g_state.fps > 0.0 ? "true" : "false") << ","
         << "\"model_ready\":" << (model_ready ? "true" : "false") << ","
-        << "\"resolution_changing\":false,"
+        << "\"resolution_changing\":" << (g_state.resolution_rebuild_active ? "true" : "false") << ","
         << "\"last_error\":\"" << (has_error ? json_escape(status_text) : "") << "\","
         << "\"message\":\"" << json_escape(status_text) << "\""
         << "}"
@@ -1394,28 +1550,31 @@ void apply_json_state(const std::string& body) {
         if (find_string(body, "prompt", s) && s != g_state.prompt) { g_state.prompt = s; reload = true; }
         if (find_number(body, "seed", n) && static_cast<int>(n) != g_state.seed) { g_state.seed = static_cast<int>(n); reload = true; }
         if (find_number(body, "strength", n) && std::fabs(static_cast<float>(n) - g_state.strength) > 1e-5f) { g_state.strength = std::clamp(static_cast<float>(n), 0.0f, 1.0f); reload = true; }
-        if (find_number(body, "steps", n)) {
-            int requested_steps = std::clamp(static_cast<int>(n), 1, 8);
-            if (requested_steps != kSupportedSteps) {
-                if (g_state.steps != kSupportedSteps) {
-                    g_state.steps = kSupportedSteps;
-                    reload = true;
-                }
-                g_state.status = "steps fixed at 2 in the current one-pass TensorRT graph";
-            } else if (g_state.steps != kSupportedSteps) {
-                g_state.steps = kSupportedSteps;
-                reload = true;
-            }
+        if (find_number(body, "steps", n) && static_cast<int>(n) != g_state.steps) {
+            g_state.steps = std::clamp(static_cast<int>(n), 2, 8);
+            reload = true;
         }
         if (find_number(body, "blend", n)) g_state.blend = std::clamp(static_cast<float>(n), 0.0f, 1.0f);
         if (find_bool(body, "passthrough", b)) g_state.passthrough = b;
         if (find_bool(body, "use_latest_frame", b)) g_state.use_latest_frame = b;
         if (find_string(body, "frame_mode", s)) g_state.use_latest_frame = (s != "fifo" && s != "no_drop");
-        if ((find_number(body, "width", n) && static_cast<int>(n) != kWidth) ||
-            (find_number(body, "height", n) && static_cast<int>(n) != kHeight)) {
-            g_state.width = kWidth;
-            g_state.height = kHeight;
-            g_state.status = "resolution fixed at 1024x1024 in the current TensorRT build";
+        bool has_width = find_number(body, "width", n);
+        int requested_width = has_width ? normalized_resolution(static_cast<int>(n)) : g_state.width;
+        bool has_height = find_number(body, "height", n);
+        int requested_height = has_height ? normalized_resolution(static_cast<int>(n)) : g_state.height;
+        if ((has_width || has_height) &&
+            (requested_width != g_state.width || requested_height != g_state.height)) {
+            if (requested_width == kWidth && requested_height == kHeight) {
+                g_state.width = kWidth;
+                g_state.height = kHeight;
+                g_state.status = "already running requested resolution";
+            } else {
+                g_state.requested_width = requested_width;
+                g_state.requested_height = requested_height;
+                g_state.resolution_rebuild_requested = true;
+                g_state.status = "queued resolution build for " +
+                    std::to_string(requested_width) + "x" + std::to_string(requested_height);
+            }
         }
         if (reload) {
             g_state.reload_requested = true;
@@ -1423,6 +1582,7 @@ void apply_json_state(const std::string& body) {
         }
     }
     if (reload) g_reload_cv.notify_one();
+    g_resolution_cv.notify_one();
 }
 
 bool use_latest_frame_mode() {
@@ -1455,6 +1615,7 @@ std::string local_mdns_name() {
 int bind_tcp_any(int port) {
     int server = socket(AF_INET6, SOCK_STREAM, 0);
     if (server >= 0) {
+        set_close_on_exec(server);
         int opt = 1;
         int dual_stack = 0;
         setsockopt(server, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
@@ -1472,6 +1633,7 @@ int bind_tcp_any(int port) {
 
     server = socket(AF_INET, SOCK_STREAM, 0);
     if (server < 0) return -1;
+    set_close_on_exec(server);
     int opt = 1;
     setsockopt(server, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
     sockaddr_in addr{};
@@ -1489,6 +1651,7 @@ int bind_tcp_any(int port) {
 int bind_udp_any(int port) {
     int sock = socket(AF_INET6, SOCK_DGRAM, 0);
     if (sock >= 0) {
+        set_close_on_exec(sock);
         int opt = 1;
         int dual_stack = 0;
         setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
@@ -1503,6 +1666,7 @@ int bind_udp_any(int port) {
 
     sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) return -1;
+    set_close_on_exec(sock);
     int opt = 1;
     setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
     sockaddr_in addr{};
@@ -1696,8 +1860,8 @@ class ConditioningWorkerClient {
   public:
     explicit ConditioningWorkerClient(const Args& args) : args_(args) {}
 
-    void start_async() {
-        if (started_) return;
+    void start_async(bool force = false) {
+        if (started_ && !force) return;
         started_ = true;
         unlink(args_.conditioning_socket.c_str());
         std::ostringstream cmd;
@@ -1729,14 +1893,23 @@ class ConditioningWorkerClient {
         start_async();
         int fd = connect_unix_socket(args_.conditioning_socket);
         if (fd < 0) {
+            if (!wait_ready(2.0)) start_async(true);
             if (!wait_ready(20.0)) {
                 error = "conditioning worker did not become ready; see /tmp/transformirror_conditioning_worker.log";
                 return false;
             }
             fd = connect_unix_socket(args_.conditioning_socket);
             if (fd < 0) {
-                error = std::string("connect conditioning worker failed: ") + std::strerror(errno);
-                return false;
+                start_async(true);
+                if (!wait_ready(20.0)) {
+                    error = "conditioning worker did not become ready after restart; see /tmp/transformirror_conditioning_worker.log";
+                    return false;
+                }
+                fd = connect_unix_socket(args_.conditioning_socket);
+                if (fd < 0) {
+                    error = std::string("connect conditioning worker failed: ") + std::strerror(errno);
+                    return false;
+                }
             }
         }
 
@@ -1766,12 +1939,143 @@ bool run_script_conditioning(const Args& args, const AppState& snapshot) {
     std::ostringstream cmd;
     cmd << shell_quote(args.python) << " export_cpp_assets.py"
         << " --out-dir " << shell_quote(args.asset_dir)
+        << " --width " << kWidth
+        << " --height " << kHeight
         << " --prompt " << shell_quote(snapshot.prompt)
         << " --seed " << snapshot.seed
         << " --strength " << snapshot.strength
         << " --steps " << snapshot.steps
         << " >/tmp/transformirror_fast_assets.log 2>&1";
     return std::system(cmd.str().c_str()) == 0;
+}
+
+void resolution_rebuild_thread(const Args& args) {
+    configure_current_thread("resolution", args.reload_core, 0);
+    while (g_running.load()) {
+        int width = kWidth;
+        int height = kHeight;
+        AppState snapshot;
+        {
+            std::unique_lock<std::mutex> lock(g_state_mutex);
+            g_resolution_cv.wait_for(lock, std::chrono::milliseconds(250), [] {
+                return !g_running.load() || g_state.resolution_rebuild_requested;
+            });
+            if (!g_running.load()) break;
+            if (!g_state.resolution_rebuild_requested) continue;
+            g_state.resolution_rebuild_requested = false;
+            g_state.resolution_rebuild_active = true;
+            width = g_state.requested_width;
+            height = g_state.requested_height;
+            snapshot = g_state;
+            g_state.status = "building TensorRT app for " + std::to_string(width) + "x" + std::to_string(height);
+        }
+
+        std::string root = current_working_directory();
+        std::string key = std::to_string(width) + "x" + std::to_string(height);
+        std::string build_log = "/tmp/transformirror_resolution_build_" + key + ".log";
+        std::ostringstream cmd;
+        cmd << "cd " << shell_quote(root) << " && "
+            << "PYTHON_BIN=" << shell_quote(args.python) << " "
+            << "TRANSFORMIRROR_PROMPT=" << shell_quote(snapshot.prompt) << " "
+            << "TRANSFORMIRROR_SEED=" << snapshot.seed << " "
+            << "TRANSFORMIRROR_STRENGTH=" << snapshot.strength << " "
+            << "TRANSFORMIRROR_STEPS=" << snapshot.steps << " "
+            << shell_quote(join_path(root, "scripts/build_resolution_app.sh"))
+            << " " << width << " " << height
+            << " >" << shell_quote(build_log) << " 2>&1";
+        int rc = std::system(cmd.str().c_str());
+        if (rc == 0) {
+            {
+                std::lock_guard<std::mutex> lock(g_reexec_mutex);
+                g_reexec_binary = join_path(join_path(root, "cpp/build_" + key), "transformirror_fast_app");
+                g_reexec_engine_dir = join_path(join_path(root, "trt_engines"), key);
+                g_reexec_asset_dir = join_path(g_reexec_engine_dir, "assets");
+            }
+            {
+                std::lock_guard<std::mutex> lock(g_state_mutex);
+                g_state.status = "switching to " + key + " build";
+                g_state.resolution_rebuild_active = false;
+            }
+            g_reexec_requested.store(true);
+            g_running.store(false);
+            g_reload_cv.notify_all();
+            g_resolution_cv.notify_all();
+            break;
+        } else {
+            std::lock_guard<std::mutex> lock(g_state_mutex);
+            g_state.status = "resolution build failed for " + key + "; see " + build_log;
+            g_state.resolution_rebuild_active = false;
+        }
+    }
+}
+
+void append_arg(std::vector<std::string>& args, const std::string& key, const std::string& value) {
+    args.push_back(key);
+    args.push_back(value);
+}
+
+bool reexec_if_requested(const Args& args) {
+    if (!g_reexec_requested.load()) return false;
+    std::string binary;
+    std::string engine_dir;
+    std::string asset_dir;
+    {
+        std::lock_guard<std::mutex> lock(g_reexec_mutex);
+        binary = g_reexec_binary;
+        engine_dir = g_reexec_engine_dir;
+        asset_dir = g_reexec_asset_dir;
+    }
+    if (binary.empty()) return false;
+
+    AppState state;
+    {
+        std::lock_guard<std::mutex> lock(g_state_mutex);
+        state = g_state;
+    }
+
+    std::vector<std::string> argv;
+    argv.push_back(binary);
+    append_arg(argv, "--engine-dir", engine_dir);
+    append_arg(argv, "--asset-dir", asset_dir);
+    append_arg(argv, "--web-root", args.web_root);
+    append_arg(argv, "--conditioning-backend", args.conditioning_backend);
+    append_arg(argv, "--conditioning-script", args.conditioning_script);
+    append_arg(argv, "--conditioning-socket", args.conditioning_socket);
+    append_arg(argv, "--camera-device", args.camera_device);
+    append_arg(argv, "--capture-backend", args.capture_backend);
+    append_arg(argv, "--display-backend", args.display_backend);
+    append_arg(argv, "--python", args.python);
+    append_arg(argv, "--capture-width", std::to_string(args.capture_width));
+    append_arg(argv, "--capture-height", std::to_string(args.capture_height));
+    append_arg(argv, "--camera-fps", std::to_string(args.camera_fps));
+    append_arg(argv, "--http-port", std::to_string(args.http_port));
+    append_arg(argv, "--osc-port", std::to_string(args.osc_port));
+    if (args.max_frames > 0) append_arg(argv, "--max-frames", std::to_string(args.max_frames));
+    if (args.main_core >= 0) append_arg(argv, "--main-core", std::to_string(args.main_core));
+    if (args.capture_core >= 0) append_arg(argv, "--capture-core", std::to_string(args.capture_core));
+    if (args.http_core >= 0) append_arg(argv, "--http-core", std::to_string(args.http_core));
+    if (args.osc_core >= 0) append_arg(argv, "--osc-core", std::to_string(args.osc_core));
+    if (args.reload_core >= 0) append_arg(argv, "--reload-core", std::to_string(args.reload_core));
+    if (args.rt_priority > 0) append_arg(argv, "--rt-priority", std::to_string(args.rt_priority));
+    if (args.lock_memory) argv.push_back("--lock-memory");
+    append_arg(argv, "--initial-prompt", state.prompt);
+    append_arg(argv, "--initial-seed", std::to_string(state.seed));
+    append_arg(argv, "--initial-strength", std::to_string(state.strength));
+    append_arg(argv, "--initial-steps", std::to_string(state.steps));
+    append_arg(argv, "--initial-blend", std::to_string(state.blend));
+    append_arg(argv, "--initial-passthrough", state.passthrough ? "1" : "0");
+    append_arg(argv, "--initial-use-latest-frame", state.use_latest_frame ? "1" : "0");
+
+    std::vector<char*> exec_argv;
+    exec_argv.reserve(argv.size() + 1);
+    for (std::string& value : argv) exec_argv.push_back(value.data());
+    exec_argv.push_back(nullptr);
+
+    std::cerr << "exec: " << binary << " --engine-dir " << engine_dir
+              << " --asset-dir " << asset_dir << "\n";
+    execv(binary.c_str(), exec_argv.data());
+    warn_errno("execv");
+    return true;
 }
 
 void asset_reload_thread(const Args& args, FastPipeline* pipeline) {
@@ -1854,6 +2158,7 @@ void asset_reload_thread(const Args& args, FastPipeline* pipeline) {
 int main(int argc, char** argv) {
     try {
         Args args = parse_args(argc, argv);
+        apply_initial_state(args);
         signal(SIGINT, on_signal);
         signal(SIGTERM, on_signal);
         configure_current_thread("main-frame", args.main_core, args.rt_priority);
@@ -1888,6 +2193,8 @@ int main(int argc, char** argv) {
                   << " udp://" << mdns << ":" << args.osc_port << "\n";
         std::thread reloader(asset_reload_thread, std::cref(args), &pipeline);
         reloader.detach();
+        std::thread resolver(resolution_rebuild_thread, std::cref(args));
+        resolver.detach();
 
         FILE* camera = nullptr;
         std::unique_ptr<CaptureReader> ffmpeg_capture;
@@ -1959,8 +2266,12 @@ int main(int argc, char** argv) {
         g_running.store(false);
         if (v4l2_capture) v4l2_capture->stop();
         if (ffmpeg_capture) ffmpeg_capture->stop();
+        gl_display.reset();
+        v4l2_capture.reset();
+        ffmpeg_capture.reset();
         if (camera) pclose(camera);
         if (display) pclose(display);
+        if (reexec_if_requested(args)) return 1;
         return 0;
     } catch (const std::exception& e) {
         std::cerr << "error: " << e.what() << "\n";

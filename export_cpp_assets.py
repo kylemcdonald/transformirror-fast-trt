@@ -10,6 +10,8 @@ from diffusers.utils.logging import disable_progress_bar
 
 from fastest_sdxl_turbo_img2img import PROMPT, make_test_image, to_input_tensor
 
+MAX_DENOISE_STEPS = 8
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -58,8 +60,16 @@ def main():
 
     pipe.scheduler.set_timesteps(args.steps, device=device)
     timesteps, effective_steps = pipe.get_timesteps(args.steps, args.strength, device)
-    sigma = pipe.scheduler.sigmas[pipe.scheduler.begin_index].to(device=device, dtype=torch.float32)
-    sigma_scale = torch.sqrt(sigma * sigma + 1.0)
+    if len(timesteps) < 1:
+        raise ValueError(f"this fast path expects at least one effective denoise step, got {len(timesteps)}")
+    if len(timesteps) > MAX_DENOISE_STEPS:
+        raise ValueError(f"this fast path supports at most {MAX_DENOISE_STEPS} effective denoise steps, got {len(timesteps)}")
+    sigmas = pipe.scheduler.sigmas[
+        pipe.scheduler.begin_index : pipe.scheduler.begin_index + len(timesteps) + 1
+    ].to(device=device, dtype=torch.float32)
+    sigma_scales = torch.sqrt(sigmas[:-1] * sigmas[:-1] + 1.0)
+    inv_sigma_scales = torch.reciprocal(sigma_scales)
+    step_params = torch.stack((sigmas[:-1], sigmas[1:], inv_sigma_scales), dim=1).contiguous()
 
     projection_dim = (
         int(pooled_prompt_embeds.shape[-1])
@@ -90,6 +100,7 @@ def main():
 
     input_image = to_input_tensor(make_test_image(args.height, args.width), device)
     timestep = timesteps[:1].to(device=device, dtype=torch.float32)
+    timesteps_f32 = timesteps.to(device=device, dtype=torch.float32).contiguous()
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     save_tensor(args.out_dir / "input_image.fp16", input_image)
@@ -98,10 +109,17 @@ def main():
     save_tensor(args.out_dir / "text_embeds.fp16", pooled_prompt_embeds)
     save_tensor(args.out_dir / "time_ids.fp16", time_ids)
     save_tensor(args.out_dir / "timestep.f32", timestep)
+    timesteps_array = np.zeros((MAX_DENOISE_STEPS,), dtype=np.float32)
+    timesteps_array[: len(timesteps)] = timesteps_f32.detach().cpu().numpy()
+    step_params_array = np.zeros((MAX_DENOISE_STEPS, 3), dtype=np.float32)
+    step_params_array[: len(timesteps), :] = step_params.detach().cpu().numpy()
+    (args.out_dir / "timesteps.f32").write_bytes(timesteps_array.tobytes())
+    (args.out_dir / "step_params.f32").write_bytes(step_params_array.tobytes())
+    (args.out_dir / "step_count.i32").write_bytes(np.asarray([len(timesteps)], dtype=np.int32).tobytes())
     params = np.asarray(
         [
-            float(sigma.detach().cpu()),
-            float(1.0 / sigma_scale.detach().cpu()),
+            float(sigmas[0].detach().cpu()),
+            float(inv_sigma_scales[0].detach().cpu()),
             float(pipe.vae.config.scaling_factor),
             float(1.0 / pipe.vae.config.scaling_factor),
         ],
@@ -118,8 +136,8 @@ def main():
         "seed": args.seed,
         "effective_steps": int(effective_steps),
         "timesteps": [float(t.detach().cpu()) for t in timesteps],
-        "sigma": float(sigma.detach().cpu()),
-        "sigma_scale": float(sigma_scale.detach().cpu()),
+        "sigmas": [float(s.detach().cpu()) for s in sigmas],
+        "step_params": step_params.detach().cpu().numpy().tolist(),
         "scaling_factor": float(pipe.vae.config.scaling_factor),
         "shapes": {
             "input_image": list(input_image.shape),

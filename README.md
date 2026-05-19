@@ -50,6 +50,7 @@ single-webcam use, the live app stays on the lower-latency single-frame path.
 * serves a browser control frontend over HTTP
 * receives OSC control messages over UDP
 * hot-loads prompt/seed/strength/step conditioning assets without restarting
+* builds and switches to matching resolution-specific TensorRT plans on request
 * defaults to lowest-latency capture: always process the newest camera frame
 
 The frame loop is C++/CUDA/TensorRT. Prompt/seed/strength/step edits are handled
@@ -196,10 +197,19 @@ curl -X POST http://localhost:8080/api/state \
   -d '{"prompt":"a neon mirror portrait","seed":42,"strength":0.7,"steps":2,"blend":0.5,"use_latest_frame":true}'
 ```
 
-Prompt, seed, and strength trigger asynchronous conditioning regeneration.
+Prompt, seed, strength, and steps trigger asynchronous conditioning regeneration.
 With the default persistent worker, prompt changes are typically tens of
-milliseconds after the worker has warmed. The current fastest TensorRT graph is
-one pass and clamps `steps` to `2`. Blend and passthrough update immediately.
+milliseconds after the worker has warmed. `steps` accepts `2..8`; SDXL Turbo
+img2img may resolve that to fewer effective denoise passes depending on
+`strength`, and each extra effective pass adds another UNet call. Blend and
+passthrough update immediately.
+
+Changing `width` or `height` queues a background build for a matching
+fixed-shape TensorRT app. The current app keeps running during the build, then
+does a brief automatic handoff to the newly built binary on the same HTTP and
+OSC ports. First use of a new resolution can take minutes because ONNX export
+and TensorRT plan building are expensive; subsequent switches reuse existing
+artifacts when possible.
 
 `use_latest_frame` controls capture behavior:
 
@@ -246,10 +256,12 @@ fallback if X11/OpenGL is unavailable.
 
 ## Resolution Notes
 
-The current fast path is fixed-shape TensorRT. The app exposes width/height in
-the API for compatibility with earlier Transformirror control surfaces, but the
-default build only ships commands for 1024x1024 engines. Changing resolution
-properly means exporting and building a matching set of TensorRT plans.
+The realtime path is still fixed-shape TensorRT, but the app now automates the
+shape change. When a new width/height is requested, `scripts/build_resolution_app.sh`
+exports matching ONNX graphs if needed, builds TensorRT plans if needed, exports
+conditioning assets for the current prompt/seed/strength/steps, compiles a
+shape-specific C++ binary, and hands off to it automatically. Resolution values
+are rounded to 32-pixel increments and clamped to `256..1280`.
 
 ## Architectural Research Notes
 

@@ -8,6 +8,8 @@ set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
     set(CMAKE_CUDA_ARCHITECTURES native)
 endif()
+set(TRANSFORMIRROR_WIDTH "1024" CACHE STRING "Transformirror diffusion width")
+set(TRANSFORMIRROR_HEIGHT "1024" CACHE STRING "Transformirror diffusion height")
 
 add_executable(trt_sdxl_runner trt_sdxl_runner.cu)
 target_include_directories(
@@ -30,6 +32,12 @@ target_include_directories(
     PRIVATE
     /usr/include/x86_64-linux-gnu
     /usr/local/cuda/include
+)
+target_compile_definitions(
+    transformirror_fast_app
+    PRIVATE
+    TRANSFORMIRROR_WIDTH=${TRANSFORMIRROR_WIDTH}
+    TRANSFORMIRROR_HEIGHT=${TRANSFORMIRROR_HEIGHT}
 )
 target_link_libraries(
     transformirror_fast_app
