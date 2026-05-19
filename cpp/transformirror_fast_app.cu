@@ -579,8 +579,21 @@ class GlDisplay {
         CHECK_CUDA(cudaMemcpy(mapped, device_rgb, rgb_bytes_, cudaMemcpyDeviceToDevice));
         CHECK_CUDA(cudaGraphicsUnmapResources(1, &cuda_resource_, 0));
 
+        int viewport_x = 0;
+        int viewport_y = 0;
+        int viewport_w = window_width_;
+        int viewport_h = window_height_;
+        if (window_width_ > window_height_) {
+            viewport_w = window_height_;
+            viewport_x = (window_width_ - viewport_w) / 2;
+        } else if (window_height_ > window_width_) {
+            viewport_h = window_width_;
+            viewport_y = (window_height_ - viewport_h) / 2;
+        }
+
         glViewport(0, 0, window_width_, window_height_);
         glClear(GL_COLOR_BUFFER_BIT);
+        glViewport(viewport_x, viewport_y, viewport_w, viewport_h);
         glBindTexture(GL_TEXTURE_2D, texture_);
         glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo_);
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, kWidth, kHeight, GL_RGB, GL_UNSIGNED_BYTE, nullptr);
