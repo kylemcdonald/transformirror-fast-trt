@@ -89,6 +89,7 @@ class Logger final : public nvinfer1::ILogger {
 struct Args {
     std::string engine_dir = "onnx";
     std::string asset_dir = "cpp_assets";
+    std::string web_root = "web";
     std::string camera_device = "/dev/video0";
     std::string capture_backend = "v4l2";
     std::string display_backend = "gl";
@@ -119,6 +120,15 @@ struct AppState {
     bool use_latest_frame = true;
     int width = kWidth;
     int height = kHeight;
+    int http_port = 8080;
+    int osc_port = 9000;
+    int camera_source_width = 0;
+    int camera_source_height = 0;
+    int camera_crop_width = kWidth;
+    int camera_crop_height = kHeight;
+    int display_width = kWidth;
+    int display_height = kHeight;
+    double camera_fps = 0.0;
     double fps = 0.0;
     double frame_ms = 0.0;
     double capture_ms = 0.0;
@@ -201,6 +211,7 @@ Args parse_args(int argc, char** argv) {
         };
         if (key == "--engine-dir") args.engine_dir = val("--engine-dir");
         else if (key == "--asset-dir") args.asset_dir = val("--asset-dir");
+        else if (key == "--web-root") args.web_root = val("--web-root");
         else if (key == "--camera-device") args.camera_device = val("--camera-device");
         else if (key == "--capture-backend") args.capture_backend = val("--capture-backend");
         else if (key == "--display-backend") args.display_backend = val("--display-backend");
@@ -228,7 +239,7 @@ Args parse_args(int argc, char** argv) {
         else if (key == "--help" || key == "-h") {
             std::cout
                 << "Usage: transformirror_fast_app [--camera-device /dev/video0]\n"
-                << "       [--engine-dir onnx] [--asset-dir cpp_assets]\n"
+                << "       [--engine-dir onnx] [--asset-dir cpp_assets] [--web-root web]\n"
                 << "       [--capture-backend v4l2|ffmpeg] [--display-backend gl|ffplay|none]\n"
                 << "       [--http-port 8080] [--osc-port 9000] [--no-display]\n"
                 << "       [--realtime] [--lock-memory] [--rt-priority N]\n"
@@ -257,6 +268,14 @@ std::vector<char> read_file(const std::string& path) {
     std::vector<char> data(static_cast<size_t>(size));
     if (!file.read(data.data(), size)) throw std::runtime_error("failed to read " + path);
     return data;
+}
+
+std::string read_text_file_or_empty(const std::string& path) {
+    std::ifstream file(path);
+    if (!file) return "";
+    std::ostringstream text;
+    text << file.rdbuf();
+    return text.str();
 }
 
 template <typename T>
@@ -566,6 +585,9 @@ class GlDisplay {
 
     GlDisplay(const GlDisplay&) = delete;
     GlDisplay& operator=(const GlDisplay&) = delete;
+
+    int width() const { return window_width_; }
+    int height() const { return window_height_; }
 
     bool render(const uint8_t* device_rgb) {
         pump_events();
@@ -939,6 +961,9 @@ class V4L2CaptureReader {
     V4L2CaptureReader(const V4L2CaptureReader&) = delete;
     V4L2CaptureReader& operator=(const V4L2CaptureReader&) = delete;
 
+    int source_width() const { return actual_width_; }
+    int source_height() const { return actual_height_; }
+
     bool read_frame(uint8_t* dst) {
         std::unique_lock<std::mutex> lock(mutex_);
         cv_.wait(lock, [&] { return !queue_.empty() || !running_.load() || !g_running.load(); });
@@ -1132,7 +1157,7 @@ input[type=range]{width:100%}textarea{width:100%;height:88px}button{cursor:point
 const ui={};
 for (const id of ['status','prompt','seed','strength','strengthv','steps','blend','blendv','passthrough','frame_mode','resolution','apply']) ui[id]=document.getElementById(id);
 async function getState(){const r=await fetch('/api/state',{cache:'no-store'});if(!r.ok)throw new Error(`HTTP ${r.status}`);return await r.json()}
-function statusLine(s){return `${s.status} | ${s.fps.toFixed(1)} fps | model ${s.frame_ms.toFixed(2)} ms | capture ${s.capture_ms.toFixed(2)} ms | display ${s.display_ms.toFixed(2)} ms | loop ${s.loop_ms.toFixed(2)} ms | queued ${s.queued_frames} | dropped ${s.dropped_frames}`}
+function statusLine(s){return `${s.status_text || s.status?.message || 'running'} | ${s.fps.toFixed(1)} fps | model ${s.frame_ms.toFixed(2)} ms | capture ${s.capture_ms.toFixed(2)} ms | display ${s.display_ms.toFixed(2)} ms | loop ${s.loop_ms.toFixed(2)} ms | queued ${s.queued_frames} | dropped ${s.dropped_frames}`}
 function fill(s){ui.status.textContent=statusLine(s);
 ui.prompt.value=s.prompt;ui.seed.value=s.seed;ui.strength.value=s.strength;ui.strengthv.textContent=s.strength.toFixed(2);
 ui.steps.value=s.steps;ui.blend.value=s.blend;ui.blendv.textContent=s.blend.toFixed(2);ui.passthrough.checked=s.passthrough;
@@ -1144,6 +1169,12 @@ ui.apply.onclick=async()=>{let [w,h]=ui.resolution.value.split('x').map(Number);
 setInterval(refresh,1000);
 getState().then(fill).catch(e=>{ui.status.textContent=`error: ${e.message}`});
 </script></body></html>)HTML";
+}
+
+std::string frontend_page(const std::string& web_root) {
+    std::string disk = read_text_file_or_empty(join_path(web_root, "index.html"));
+    if (!disk.empty()) return disk;
+    return html_page();
 }
 
 std::string json_escape(const std::string& s) {
@@ -1158,6 +1189,16 @@ std::string json_escape(const std::string& s) {
 
 std::string state_json() {
     std::lock_guard<std::mutex> lock(g_state_mutex);
+    const std::string status_text = g_state.status;
+    const bool has_error =
+        status_text.find("failed") != std::string::npos ||
+        status_text.find("error") != std::string::npos;
+    const bool model_ready =
+        status_text.find("starting") == std::string::npos &&
+        status_text.find("regenerating") == std::string::npos;
+    const double diffusion_fps = g_state.frame_ms > 0.0 ? 1000.0 / g_state.frame_ms : g_state.fps;
+    const double display_fps = g_state.fps;
+    const double camera_fps = g_state.camera_fps > 0.0 ? g_state.camera_fps : g_state.fps;
     std::ostringstream out;
     out << "{"
         << "\"prompt\":\"" << json_escape(g_state.prompt) << "\","
@@ -1176,7 +1217,44 @@ std::string state_json() {
         << "\"loop_ms\":" << g_state.loop_ms << ","
         << "\"queued_frames\":" << g_state.queued_frames << ","
         << "\"dropped_frames\":" << g_state.dropped_frames << ","
-        << "\"status\":\"" << json_escape(g_state.status) << "\""
+        << "\"status_text\":\"" << json_escape(status_text) << "\","
+        << "\"controls\":{"
+        << "\"prompt\":\"" << json_escape(g_state.prompt) << "\","
+        << "\"seed\":" << g_state.seed << ","
+        << "\"strength\":" << g_state.strength << ","
+        << "\"steps\":" << g_state.steps << ","
+        << "\"blend\":" << g_state.blend
+        << "},"
+        << "\"config\":{"
+        << "\"width\":" << g_state.width << ","
+        << "\"height\":" << g_state.height << ","
+        << "\"http_port\":" << g_state.http_port << ","
+        << "\"osc_port\":" << g_state.osc_port
+        << "},"
+        << "\"stats\":{"
+        << "\"camera_source_width\":" << g_state.camera_source_width << ","
+        << "\"camera_source_height\":" << g_state.camera_source_height << ","
+        << "\"camera_crop_width\":" << g_state.camera_crop_width << ","
+        << "\"camera_crop_height\":" << g_state.camera_crop_height << ","
+        << "\"camera_fps\":" << camera_fps << ","
+        << "\"display_width\":" << g_state.display_width << ","
+        << "\"display_height\":" << g_state.display_height << ","
+        << "\"display_fps\":" << display_fps << ","
+        << "\"diffusion_ms\":" << g_state.frame_ms << ","
+        << "\"diffusion_fps\":" << diffusion_fps << ","
+        << "\"capture_ms\":" << g_state.capture_ms << ","
+        << "\"display_ms\":" << g_state.display_ms << ","
+        << "\"loop_ms\":" << g_state.loop_ms << ","
+        << "\"queued_frames\":" << g_state.queued_frames << ","
+        << "\"dropped_frames\":" << g_state.dropped_frames
+        << "},"
+        << "\"status\":{"
+        << "\"camera_ready\":" << (g_state.fps > 0.0 ? "true" : "false") << ","
+        << "\"model_ready\":" << (model_ready ? "true" : "false") << ","
+        << "\"resolution_changing\":false,"
+        << "\"last_error\":\"" << (has_error ? json_escape(status_text) : "") << "\","
+        << "\"message\":\"" << json_escape(status_text) << "\""
+        << "}"
         << "}";
     return out.str();
 }
@@ -1335,7 +1413,7 @@ int bind_udp_any(int port) {
     return sock;
 }
 
-void http_thread(int port, int core, int rt_priority) {
+void http_thread(int port, int core, int rt_priority, std::string web_root) {
     configure_current_thread("http", core, rt_priority > 0 ? 1 : 0);
     int server = bind_tcp_any(port);
     if (server < 0) {
@@ -1357,7 +1435,9 @@ void http_thread(int port, int core, int rt_priority) {
         if (body_pos != std::string::npos) body = req.substr(body_pos + 4);
         if (get && req.find("GET /api/state ") == 0) send_http(client, "200 OK", "application/json", state_json());
         else if (post && req.find("POST /api/state ") == 0) { apply_json_state(body); send_http(client, "200 OK", "application/json", state_json()); }
-        else if (get && req.find("GET / ") == 0) send_http(client, "200 OK", "text/html; charset=utf-8", html_page());
+        else if (get && (req.find("GET / ") == 0 || req.find("GET /index.html ") == 0)) {
+            send_http(client, "200 OK", "text/html; charset=utf-8", frontend_page(web_root));
+        }
         else send_http(client, "404 Not Found", "text/plain", "not found\n");
         close(client);
     }
@@ -1487,10 +1567,17 @@ int main(int argc, char** argv) {
         if (args.lock_memory) try_lock_process_memory();
         {
             std::lock_guard<std::mutex> lock(g_state_mutex);
+            g_state.http_port = args.http_port;
+            g_state.osc_port = args.osc_port;
+            g_state.camera_source_width = args.capture_width;
+            g_state.camera_source_height = args.capture_height;
+            g_state.camera_fps = args.camera_fps;
+            g_state.display_width = kWidth;
+            g_state.display_height = kHeight;
             g_state.status = "running";
         }
 
-        std::thread http(http_thread, args.http_port, args.http_core, args.rt_priority);
+        std::thread http(http_thread, args.http_port, args.http_core, args.rt_priority, args.web_root);
         http.detach();
         std::thread osc(osc_thread, args.osc_port, args.osc_core, args.rt_priority);
         osc.detach();
@@ -1509,6 +1596,9 @@ int main(int argc, char** argv) {
         std::unique_ptr<V4L2CaptureReader> v4l2_capture;
         if (args.capture_backend == "v4l2") {
             v4l2_capture.reset(new V4L2CaptureReader(args, pipeline.rgb_bytes()));
+            std::lock_guard<std::mutex> lock(g_state_mutex);
+            g_state.camera_source_width = v4l2_capture->source_width();
+            g_state.camera_source_height = v4l2_capture->source_height();
         } else {
             std::string cap_cmd = ffmpeg_capture_cmd(args);
             std::cerr << "camera: " << cap_cmd << "\n";
@@ -1530,6 +1620,9 @@ int main(int argc, char** argv) {
             if (!display) throw std::runtime_error("failed to start ffplay display");
         } else if (args.display_backend == "gl") {
             gl_display.reset(new GlDisplay(pipeline.rgb_bytes()));
+            std::lock_guard<std::mutex> lock(g_state_mutex);
+            g_state.display_width = gl_display->width();
+            g_state.display_height = gl_display->height();
         }
 
         int frames = 0;
@@ -1557,6 +1650,10 @@ int main(int argc, char** argv) {
                 g_state.capture_ms = std::chrono::duration<double, std::milli>(capture_end - capture_start).count();
                 g_state.display_ms = std::chrono::duration<double, std::milli>(display_end - display_start).count();
                 g_state.loop_ms = std::chrono::duration<double, std::milli>(now - loop_start).count();
+                if (gl_display) {
+                    g_state.display_width = gl_display->width();
+                    g_state.display_height = gl_display->height();
+                }
                 fps_start = now;
                 frames = 0;
             }
