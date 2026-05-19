@@ -53,6 +53,7 @@ namespace {
 
 constexpr int kWidth = 1024;
 constexpr int kHeight = 1024;
+constexpr int kSupportedSteps = 2;
 constexpr int kImageElems = 1 * 3 * kHeight * kWidth;
 constexpr int kRgbElems = kHeight * kWidth * 3;
 constexpr int kLatentElems = 1 * 4 * 128 * 128;
@@ -1248,7 +1249,10 @@ std::string state_json() {
     const std::string status_text = g_state.status;
     const bool has_error =
         status_text.find("failed") != std::string::npos ||
-        status_text.find("error") != std::string::npos;
+        status_text.find("error") != std::string::npos ||
+        status_text.find("unsupported") != std::string::npos ||
+        status_text.find("fixed") != std::string::npos ||
+        status_text.find("expects") != std::string::npos;
     const bool model_ready =
         status_text.find("starting") == std::string::npos &&
         status_text.find("regenerating") == std::string::npos;
@@ -1390,13 +1394,29 @@ void apply_json_state(const std::string& body) {
         if (find_string(body, "prompt", s) && s != g_state.prompt) { g_state.prompt = s; reload = true; }
         if (find_number(body, "seed", n) && static_cast<int>(n) != g_state.seed) { g_state.seed = static_cast<int>(n); reload = true; }
         if (find_number(body, "strength", n) && std::fabs(static_cast<float>(n) - g_state.strength) > 1e-5f) { g_state.strength = std::clamp(static_cast<float>(n), 0.0f, 1.0f); reload = true; }
-        if (find_number(body, "steps", n) && static_cast<int>(n) != g_state.steps) { g_state.steps = std::clamp(static_cast<int>(n), 1, 8); reload = true; }
+        if (find_number(body, "steps", n)) {
+            int requested_steps = std::clamp(static_cast<int>(n), 1, 8);
+            if (requested_steps != kSupportedSteps) {
+                if (g_state.steps != kSupportedSteps) {
+                    g_state.steps = kSupportedSteps;
+                    reload = true;
+                }
+                g_state.status = "steps fixed at 2 in the current one-pass TensorRT graph";
+            } else if (g_state.steps != kSupportedSteps) {
+                g_state.steps = kSupportedSteps;
+                reload = true;
+            }
+        }
         if (find_number(body, "blend", n)) g_state.blend = std::clamp(static_cast<float>(n), 0.0f, 1.0f);
         if (find_bool(body, "passthrough", b)) g_state.passthrough = b;
         if (find_bool(body, "use_latest_frame", b)) g_state.use_latest_frame = b;
         if (find_string(body, "frame_mode", s)) g_state.use_latest_frame = (s != "fifo" && s != "no_drop");
-        if (find_number(body, "width", n) && static_cast<int>(n) != kWidth) g_state.status = "resolution requires matching TensorRT engines; using 1024x1024";
-        if (find_number(body, "height", n) && static_cast<int>(n) != kHeight) g_state.status = "resolution requires matching TensorRT engines; using 1024x1024";
+        if ((find_number(body, "width", n) && static_cast<int>(n) != kWidth) ||
+            (find_number(body, "height", n) && static_cast<int>(n) != kHeight)) {
+            g_state.width = kWidth;
+            g_state.height = kHeight;
+            g_state.status = "resolution fixed at 1024x1024 in the current TensorRT build";
+        }
         if (reload) {
             g_state.reload_requested = true;
             g_state.status = "conditioning reload queued";

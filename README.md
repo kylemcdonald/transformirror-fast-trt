@@ -196,10 +196,10 @@ curl -X POST http://localhost:8080/api/state \
   -d '{"prompt":"a neon mirror portrait","seed":42,"strength":0.7,"steps":2,"blend":0.5,"use_latest_frame":true}'
 ```
 
-Prompt, seed, strength, and steps trigger asynchronous conditioning regeneration.
+Prompt, seed, and strength trigger asynchronous conditioning regeneration.
 With the default persistent worker, prompt changes are typically tens of
-milliseconds after the worker has warmed. Blend and passthrough update
-immediately.
+milliseconds after the worker has warmed. The current fastest TensorRT graph is
+one pass and clamps `steps` to `2`. Blend and passthrough update immediately.
 
 `use_latest_frame` controls capture behavior:
 
