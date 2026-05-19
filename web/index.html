@@ -309,6 +309,8 @@
     const $ = (id) => document.getElementById(id);
     let applyingRemote = false;
     let debounceTimer = null;
+    let blendInFlight = false;
+    let pendingBlend = null;
 
     function setStatus(text) {
       $("status").textContent = text;
@@ -365,6 +367,30 @@
     function debounceApply(update) {
       clearTimeout(debounceTimer);
       debounceTimer = setTimeout(() => apply(update), 120);
+    }
+
+    async function flushBlend() {
+      if (blendInFlight) return;
+      blendInFlight = true;
+      try {
+        while (pendingBlend !== null) {
+          const blend = pendingBlend;
+          pendingBlend = null;
+          await postState({ blend });
+        }
+      } catch (err) {
+        setStatus(`Blend update failed: ${err.message}`);
+      } finally {
+        blendInFlight = false;
+        if (pendingBlend !== null) {
+          flushBlend();
+        }
+      }
+    }
+
+    function sendBlend(value) {
+      pendingBlend = Number(value);
+      flushBlend();
     }
 
     function render(state, keepPromptFocus = false) {
@@ -427,7 +453,7 @@
       apply({ seed });
     });
 
-    [["strength", "strengthNumber"], ["blend", "blendNumber"], ["steps", "stepsNumber"]].forEach(([rangeId, numberId]) => {
+    [["strength", "strengthNumber"], ["steps", "stepsNumber"]].forEach(([rangeId, numberId]) => {
       $(rangeId).addEventListener("input", () => {
         if (applyingRemote) return;
         $(numberId).value = $(rangeId).value;
@@ -438,6 +464,17 @@
         $(rangeId).value = $(numberId).value;
         debounceApply({ [rangeId]: Number($(numberId).value) });
       });
+    });
+
+    $("blend").addEventListener("input", () => {
+      if (applyingRemote) return;
+      $("blendNumber").value = $("blend").value;
+      sendBlend($("blend").value);
+    });
+    $("blendNumber").addEventListener("input", () => {
+      if (applyingRemote) return;
+      $("blend").value = $("blendNumber").value;
+      sendBlend($("blendNumber").value);
     });
 
     $("seed").addEventListener("change", () => apply({ seed: Number($("seed").value) }));
