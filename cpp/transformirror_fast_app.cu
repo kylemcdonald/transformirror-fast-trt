@@ -11,6 +11,7 @@
 
 #include <arpa/inet.h>
 #include <cstdio>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <jpeglib.h>
@@ -423,6 +424,67 @@ std::vector<char> read_exact_asset(const std::string& path, size_t bytes) {
 
 bool file_exists(const std::string& path) {
     return access(path.c_str(), F_OK) == 0;
+}
+
+struct ResolutionEntry {
+    int width = 0;
+    int height = 0;
+};
+
+bool parse_resolution_key(const std::string& name, int& width, int& height) {
+    size_t x = name.find('x');
+    if (x == std::string::npos || x == 0 || x + 1 >= name.size()) return false;
+    try {
+        width = std::stoi(name.substr(0, x));
+        height = std::stoi(name.substr(x + 1));
+    } catch (...) {
+        return false;
+    }
+    return width > 0 && height > 0;
+}
+
+bool cached_resolution_complete(const std::string& root, const std::string& key) {
+    std::string engine_dir = join_path(join_path(root, "trt_engines"), key);
+    std::string build_dir = join_path(join_path(root, "cpp"), "build_" + key);
+    return file_exists(join_path(engine_dir, "taesdxl_encode.plan")) &&
+           file_exists(join_path(engine_dir, "taesdxl_decode.plan")) &&
+           file_exists(join_path(engine_dir, "sdxl_turbo_unet.plan")) &&
+           file_exists(join_path(build_dir, "transformirror_fast_app"));
+}
+
+std::string cached_resolutions_json() {
+    std::string root = current_working_directory();
+    std::string engine_root = join_path(root, "trt_engines");
+    std::vector<ResolutionEntry> entries;
+    DIR* dir = opendir(engine_root.c_str());
+    if (dir) {
+        while (dirent* ent = readdir(dir)) {
+            std::string name = ent->d_name;
+            int width = 0;
+            int height = 0;
+            if (!parse_resolution_key(name, width, height)) continue;
+            if (!cached_resolution_complete(root, name)) continue;
+            entries.push_back({width, height});
+        }
+        closedir(dir);
+    }
+    std::sort(entries.begin(), entries.end(), [](const ResolutionEntry& a, const ResolutionEntry& b) {
+        if (a.width * a.height != b.width * b.height) return a.width * a.height > b.width * b.height;
+        if (a.width != b.width) return a.width > b.width;
+        return a.height > b.height;
+    });
+    entries.erase(std::unique(entries.begin(), entries.end(), [](const ResolutionEntry& a, const ResolutionEntry& b) {
+        return a.width == b.width && a.height == b.height;
+    }), entries.end());
+
+    std::ostringstream out;
+    out << "[";
+    for (size_t i = 0; i < entries.size(); ++i) {
+        if (i) out << ",";
+        out << "{\"width\":" << entries[i].width << ",\"height\":" << entries[i].height << "}";
+    }
+    out << "]";
+    return out.str();
 }
 
 AssetBlob read_asset_blob(const std::string& asset_dir) {
@@ -1399,6 +1461,7 @@ std::string json_escape(const std::string& s) {
 }
 
 std::string state_json() {
+    const std::string cached_resolutions = cached_resolutions_json();
     std::lock_guard<std::mutex> lock(g_state_mutex);
     const std::string status_text = g_state.status;
     const bool has_error =
@@ -1445,6 +1508,7 @@ std::string state_json() {
         << "\"height\":" << g_state.height << ","
         << "\"requested_width\":" << g_state.requested_width << ","
         << "\"requested_height\":" << g_state.requested_height << ","
+        << "\"cached_resolutions\":" << cached_resolutions << ","
         << "\"http_port\":" << g_state.http_port << ","
         << "\"osc_port\":" << g_state.osc_port
         << "},"

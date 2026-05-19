@@ -250,14 +250,7 @@
           <input id="height" type="number" min="256" max="1280" step="32" title="Changes build and switch to matching TensorRT engines automatically">
         </div>
 
-        <div class="buttons">
-          <button id="res1280x720" title="Builds matching TensorRT engines if needed">1280 x 720</button>
-          <button id="res1280x640" title="Builds matching TensorRT engines if needed">1280 x 640</button>
-          <button id="res1024x512" title="Builds matching TensorRT engines if needed">1024 x 512</button>
-          <button id="res1024x1024" title="Builds matching TensorRT engines if needed">1024 x 1024</button>
-          <button id="res768x768" title="Builds matching TensorRT engines if needed">768 x 768</button>
-          <button id="res512x512" title="Builds matching TensorRT engines if needed">512 x 512</button>
-        </div>
+        <div class="buttons" id="resolutionButtons"></div>
 
         <div class="field">
           <label for="seed" title="OSC: /seed 42">Seed</label>
@@ -317,6 +310,7 @@
     let debounceTimer = null;
     let blendInFlight = false;
     let pendingBlend = null;
+    let resolutionButtonsKey = "";
 
     function setStatus(text) {
       $("status").textContent = text;
@@ -399,9 +393,35 @@
       flushBlend();
     }
 
+    function renderResolutionButtons(state) {
+      const cached = state.config.cached_resolutions || [];
+      const key = cached.map((res) => `${res.width}x${res.height}`).join(",");
+      if (key === resolutionButtonsKey) return;
+      resolutionButtonsKey = key;
+      const container = $("resolutionButtons");
+      container.replaceChildren();
+      if (!cached.length) {
+        const empty = document.createElement("button");
+        empty.type = "button";
+        empty.disabled = true;
+        empty.textContent = "No cached resolutions";
+        container.appendChild(empty);
+        return;
+      }
+      cached.forEach((res) => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.textContent = `${res.width} x ${res.height}`;
+        button.title = "Cached TensorRT build";
+        button.addEventListener("click", () => apply({ width: res.width, height: res.height }));
+        container.appendChild(button);
+      });
+    }
+
     function render(state, keepPromptFocus = false) {
       applyingRemote = true;
       const controls = state.controls;
+      renderResolutionButtons(state);
       if (!isFocused("prompt") && !(keepPromptFocus && document.activeElement === $("prompt"))) {
         $("prompt").value = controls.prompt;
       }
@@ -451,12 +471,12 @@
     $("apply").addEventListener("click", () => apply());
     $("raw").addEventListener("click", () => apply({ blend: 0 }));
     $("processed").addEventListener("click", () => apply({ blend: 1 }));
-    $("res1280x720").addEventListener("click", () => apply({ width: 1280, height: 720 }));
-    $("res1280x640").addEventListener("click", () => apply({ width: 1280, height: 640 }));
-    $("res1024x512").addEventListener("click", () => apply({ width: 1024, height: 512 }));
-    $("res1024x1024").addEventListener("click", () => apply({ width: 1024, height: 1024 }));
-    $("res768x768").addEventListener("click", () => apply({ width: 768, height: 768 }));
-    $("res512x512").addEventListener("click", () => apply({ width: 512, height: 512 }));
+    $("prompt").addEventListener("keydown", (event) => {
+      if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+        event.preventDefault();
+        apply({ prompt: $("prompt").value });
+      }
+    });
     $("randomSeed").addEventListener("click", () => {
       const seed = Math.floor(Math.random() * 2147483647);
       $("seed").value = seed;
