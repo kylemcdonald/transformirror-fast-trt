@@ -110,6 +110,8 @@ def export(module, inputs, path, input_names, output_names):
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--out-dir", type=Path, default=Path("onnx"))
+    parser.add_argument("--width", type=int, default=1024)
+    parser.add_argument("--height", type=int, default=1024)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument(
         "--component",
@@ -127,12 +129,16 @@ def main():
     torch.set_grad_enabled(False)
     device = torch.device("cuda:0")
     pipe = build_original_pipeline(device)
-    image = to_input_tensor(make_test_image(1024, 1024), device)
+    image = to_input_tensor(make_test_image(args.height, args.width), device)
     if args.batch_size > 1:
         image = image.repeat(args.batch_size, 1, 1, 1).contiguous()
-    runner = ManualSDXLTurboImg2Img(pipe, PROMPT, 1024, 1024, 2, 0.7, 0, device)
+    runner = ManualSDXLTurboImg2Img(pipe, PROMPT, args.height, args.width, 2, 0.7, 0, device)
 
-    latents = torch.empty((args.batch_size, 4, 128, 128), device=device, dtype=torch.float16)
+    latents = torch.empty(
+        (args.batch_size, 4, args.height // pipe.vae_scale_factor, args.width // pipe.vae_scale_factor),
+        device=device,
+        dtype=torch.float16,
+    )
     timestep = runner.timesteps[:1].to(device=device, dtype=torch.float32)
     sigma = runner.sigma.reshape(())
     sigma_scale = runner.sigma_scale.reshape(())

@@ -1,0 +1,442 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Transformirror Control</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #101214;
+      --panel: #1a1f23;
+      --line: #343b42;
+      --text: #eef2f4;
+      --muted: #9aa5ad;
+      --accent: #52c7b8;
+      --accent-2: #f0b45b;
+      --danger: #e76f6f;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+      font: 15px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    main {
+      width: min(980px, calc(100vw - 32px));
+      margin: 0 auto;
+      padding: 28px 0 36px;
+    }
+
+    header {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 22px;
+      border-bottom: 1px solid var(--line);
+      padding-bottom: 14px;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 22px;
+      font-weight: 650;
+      letter-spacing: 0;
+    }
+
+    #status {
+      color: var(--muted);
+      font-size: 13px;
+      white-space: nowrap;
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 1.25fr 0.75fr;
+      gap: 18px;
+    }
+
+    section {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 18px;
+    }
+
+    h2 {
+      margin: 0 0 14px;
+      font-size: 15px;
+      font-weight: 650;
+    }
+
+    label {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 650;
+      margin-bottom: 6px;
+      text-transform: uppercase;
+    }
+
+    textarea,
+    input[type="number"] {
+      width: 100%;
+      background: #0d1012;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      color: var(--text);
+      font: inherit;
+      padding: 10px 11px;
+      outline: none;
+    }
+
+    textarea {
+      min-height: 148px;
+      resize: vertical;
+    }
+
+    textarea:focus,
+    input[type="number"]:focus {
+      border-color: var(--accent);
+    }
+
+    .row {
+      display: grid;
+      grid-template-columns: 1fr 86px;
+      gap: 12px;
+      align-items: center;
+      margin: 14px 0;
+    }
+
+    .field {
+      margin: 14px 0;
+    }
+
+    input[type="range"] {
+      width: 100%;
+      accent-color: var(--accent);
+    }
+
+    .buttons {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 14px;
+    }
+
+    button {
+      appearance: none;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #242b30;
+      color: var(--text);
+      cursor: pointer;
+      font: inherit;
+      font-weight: 650;
+      padding: 9px 12px;
+    }
+
+    button.primary {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #06201d;
+    }
+
+    button.secondary {
+      background: #2c2520;
+      border-color: #614b31;
+      color: #ffd69a;
+    }
+
+    button:active {
+      transform: translateY(1px);
+    }
+
+    .status-grid {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 9px 14px;
+      margin: 0;
+    }
+
+    .status-group {
+      grid-column: 1 / -1;
+      border-top: 1px solid var(--line);
+      color: var(--text);
+      font-size: 12px;
+      font-weight: 750;
+      margin-top: 6px;
+      padding-top: 10px;
+      text-transform: uppercase;
+    }
+
+    .status-group:first-child {
+      border-top: 0;
+      margin-top: 0;
+      padding-top: 0;
+    }
+
+    .status-label {
+      color: var(--muted);
+    }
+
+    .status-value {
+      font-variant-numeric: tabular-nums;
+      text-align: right;
+    }
+
+    .error {
+      color: var(--danger);
+      overflow-wrap: anywhere;
+    }
+
+    @media (max-width: 760px) {
+      main { width: min(100vw - 20px, 980px); padding-top: 18px; }
+      header { align-items: flex-start; flex-direction: column; }
+      #status { white-space: normal; }
+      .layout { grid-template-columns: 1fr; }
+      .row { grid-template-columns: 1fr 74px; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Transformirror Control</h1>
+      <div id="status">Connecting</div>
+    </header>
+
+    <div class="layout">
+      <section>
+        <h2>Effect</h2>
+        <label for="prompt" title='OSC: /prompt "a psychedelic landscape"'>Prompt</label>
+        <textarea id="prompt" spellcheck="false" title='OSC: /prompt "a psychedelic landscape"'></textarea>
+
+        <div class="row">
+          <div>
+            <label for="strength" title="OSC: /strength 0.7">Strength</label>
+            <input id="strength" type="range" min="0" max="1" step="0.01" title="OSC: /strength 0.7">
+          </div>
+          <input id="strengthNumber" type="number" min="0" max="1" step="0.01" title="OSC: /strength 0.7">
+        </div>
+
+        <div class="row">
+          <div>
+            <label for="blend" title="OSC: /blend 0.5, or /passthrough true for raw input">Blend</label>
+            <input id="blend" type="range" min="0" max="1" step="0.01" title="OSC: /blend 0.5, or /passthrough true for raw input">
+          </div>
+          <input id="blendNumber" type="number" min="0" max="1" step="0.01" title="OSC: /blend 0.5, or /passthrough true for raw input">
+        </div>
+
+        <div class="field">
+          <label for="width" title="OSC: /width 1024, or /resolution 1024 512">Width</label>
+          <input id="width" type="number" min="32" max="1280" step="32" title="OSC: /width 1024, or /resolution 1024 512">
+        </div>
+
+        <div class="field">
+          <label for="height" title="OSC: /height 512, or /resolution 1024 512">Height</label>
+          <input id="height" type="number" min="32" max="1280" step="32" title="OSC: /height 512, or /resolution 1024 512">
+        </div>
+
+        <div class="buttons">
+          <button id="res1280x720" title="OSC: /resolution 1280 720">1280 x 720</button>
+          <button id="res1280x640" title="OSC: /resolution 1280 640">1280 x 640</button>
+          <button id="res1024x512" title="OSC: /resolution 1024 512">1024 x 512</button>
+          <button id="res1024x1024" title="OSC: /resolution 1024 1024">1024 x 1024</button>
+          <button id="res768x768" title="OSC: /resolution 768 768">768 x 768</button>
+          <button id="res512x512" title="OSC: /resolution 512 512">512 x 512</button>
+        </div>
+
+        <div class="field">
+          <label for="seed" title="OSC: /seed 42">Seed</label>
+          <input id="seed" type="number" step="1" title="OSC: /seed 42">
+        </div>
+
+        <div class="row">
+          <div>
+            <label for="steps" title="OSC: /steps 2">Steps</label>
+            <input id="steps" type="range" min="2" max="8" step="1" title="OSC: /steps 2">
+          </div>
+          <input id="stepsNumber" type="number" min="2" max="8" step="1" title="OSC: /steps 2">
+        </div>
+
+        <div class="buttons">
+          <button class="primary" id="apply">Apply</button>
+          <button id="raw" title="OSC: /passthrough true, or /blend 0">Raw</button>
+          <button id="processed" title="OSC: /passthrough false, or /blend 1">Processed</button>
+          <button class="secondary" id="randomSeed" title="OSC: /seed 123456">Random Seed</button>
+        </div>
+      </section>
+
+      <section>
+        <h2>Status</h2>
+        <div class="status-grid">
+          <div class="status-group">Camera</div>
+          <div class="status-label">Status</div><div class="status-value" id="cameraReady">-</div>
+          <div class="status-label">Mode</div><div class="status-value" id="cameraMode">-</div>
+          <div class="status-label">Crop</div><div class="status-value" id="cameraCrop">-</div>
+          <div class="status-label">FPS</div><div class="status-value" id="cameraFps">-</div>
+
+          <div class="status-group">Diffusion</div>
+          <div class="status-label">Status</div><div class="status-value" id="modelReady">-</div>
+          <div class="status-label">Resolution</div><div class="status-value" id="resolution">-</div>
+          <div class="status-label">Time</div><div class="status-value" id="diffusionMs">-</div>
+          <div class="status-label">FPS</div><div class="status-value" id="diffusionFps">-</div>
+
+          <div class="status-group">Network</div>
+          <div class="status-label">HTTP Port</div><div class="status-value" id="httpPort">-</div>
+          <div class="status-label">OSC Port</div><div class="status-value" id="oscPort">-</div>
+
+          <div class="status-group">Display</div>
+          <div class="status-label">Resolution</div><div class="status-value" id="displayResolution">-</div>
+          <div class="status-label">FPS</div><div class="status-value" id="displayFps">-</div>
+
+          <div class="status-group">Error</div>
+          <div class="status-label">Last</div><div class="status-value error" id="lastError">-</div>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    let applyingRemote = false;
+    let debounceTimer = null;
+
+    function setStatus(text) {
+      $("status").textContent = text;
+    }
+
+    function setPair(rangeId, numberId, value) {
+      $(rangeId).value = value;
+      $(numberId).value = value;
+    }
+
+    async function postState(update) {
+      const res = await fetch("/api/state", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(update)
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return res.json();
+    }
+
+    function collectState() {
+      return {
+        prompt: $("prompt").value,
+        strength: Number($("strength").value),
+        blend: Number($("blend").value),
+        width: Number($("width").value),
+        height: Number($("height").value),
+        seed: Number($("seed").value),
+        steps: Number($("steps").value)
+      };
+    }
+
+    async function apply(update = collectState()) {
+      try {
+        const state = await postState(update);
+        render(state, true);
+        setStatus("Updated");
+      } catch (err) {
+        setStatus(`Update failed: ${err.message}`);
+      }
+    }
+
+    function debounceApply(update) {
+      clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(() => apply(update), 120);
+    }
+
+    function render(state, keepPromptFocus = false) {
+      applyingRemote = true;
+      const controls = state.controls;
+      if (!(keepPromptFocus && document.activeElement === $("prompt"))) {
+        $("prompt").value = controls.prompt;
+      }
+      setPair("strength", "strengthNumber", controls.strength);
+      setPair("blend", "blendNumber", controls.blend);
+      $("width").value = state.config.width;
+      $("height").value = state.config.height;
+      $("seed").value = controls.seed;
+      setPair("steps", "stepsNumber", controls.steps);
+
+      const changingSize = state.status.resolution_changing && state.stats.diffusion_fps === 0;
+
+      $("cameraReady").textContent = state.status.camera_ready ? "Ready" : "Waiting";
+      $("modelReady").textContent = changingSize ? "Changing size" : (state.status.model_ready ? "Ready" : "Loading");
+      $("resolution").textContent = `${state.config.width} x ${state.config.height}`;
+      $("displayResolution").textContent = `${state.stats.display_width} x ${state.stats.display_height}`;
+      $("cameraMode").textContent = `${state.stats.camera_source_width} x ${state.stats.camera_source_height}`;
+      $("cameraCrop").textContent = `${state.stats.camera_crop_width} x ${state.stats.camera_crop_height}`;
+      $("cameraFps").textContent = state.stats.camera_fps.toFixed(2);
+      $("displayFps").textContent = state.stats.display_fps.toFixed(2);
+      $("diffusionMs").textContent = `${state.stats.diffusion_ms.toFixed(1)} ms`;
+      $("diffusionFps").textContent = changingSize ? "Changing size" : state.stats.diffusion_fps.toFixed(2);
+      $("oscPort").textContent = state.config.osc_port;
+      $("httpPort").textContent = state.config.http_port;
+      $("lastError").textContent = state.status.last_error || "-";
+      applyingRemote = false;
+    }
+
+    async function poll() {
+      try {
+        const res = await fetch("/api/state");
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        render(await res.json());
+        setStatus("Connected");
+      } catch (err) {
+        setStatus(`Disconnected: ${err.message}`);
+      }
+    }
+
+    $("apply").addEventListener("click", () => apply());
+    $("raw").addEventListener("click", () => apply({ blend: 0 }));
+    $("processed").addEventListener("click", () => apply({ blend: 1 }));
+    $("res1280x720").addEventListener("click", () => apply({ width: 1280, height: 720 }));
+    $("res1280x640").addEventListener("click", () => apply({ width: 1280, height: 640 }));
+    $("res1024x512").addEventListener("click", () => apply({ width: 1024, height: 512 }));
+    $("res1024x1024").addEventListener("click", () => apply({ width: 1024, height: 1024 }));
+    $("res768x768").addEventListener("click", () => apply({ width: 768, height: 768 }));
+    $("res512x512").addEventListener("click", () => apply({ width: 512, height: 512 }));
+    $("randomSeed").addEventListener("click", () => {
+      const seed = Math.floor(Math.random() * 2147483647);
+      $("seed").value = seed;
+      apply({ seed });
+    });
+
+    [["strength", "strengthNumber"], ["blend", "blendNumber"], ["steps", "stepsNumber"]].forEach(([rangeId, numberId]) => {
+      $(rangeId).addEventListener("input", () => {
+        if (applyingRemote) return;
+        $(numberId).value = $(rangeId).value;
+        debounceApply({ [rangeId]: Number($(rangeId).value) });
+      });
+      $(numberId).addEventListener("input", () => {
+        if (applyingRemote) return;
+        $(rangeId).value = $(numberId).value;
+        debounceApply({ [rangeId]: Number($(numberId).value) });
+      });
+    });
+
+    $("seed").addEventListener("change", () => apply({ seed: Number($("seed").value) }));
+    $("width").addEventListener("change", () => apply({
+      width: Number($("width").value),
+      height: Number($("height").value)
+    }));
+    $("height").addEventListener("change", () => apply({
+      width: Number($("width").value),
+      height: Number($("height").value)
+    }));
+
+    poll();
+    setInterval(poll, 1000);
+  </script>
+</body>
+</html>

@@ -6,6 +6,7 @@ cpp/build/
 onnx/
 onnx_full/
 cpp_assets/
+trt_engines/
 outputs/
 *.plan
 *.onnx
