@@ -53,7 +53,9 @@ single-webcam use, the live app stays on the lower-latency single-frame path.
 * defaults to lowest-latency capture: always process the newest camera frame
 
 The frame loop is C++/CUDA/TensorRT. Prompt/seed/strength/step edits are handled
-out of band by a Python helper because text encoding is not in the realtime loop.
+out of band by a persistent Python conditioning worker because text encoding is
+not in the realtime loop. The old one-shot helper remains available with
+`--conditioning-backend script`.
 
 ## Install
 
@@ -128,6 +130,7 @@ Fullscreen webcam app:
   --capture-width 1920 \
   --capture-height 1080 \
   --camera-fps 30 \
+  --conditioning-backend worker \
   --http-port 8080 \
   --osc-port 9000
 ```
@@ -194,7 +197,9 @@ curl -X POST http://localhost:8080/api/state \
 ```
 
 Prompt, seed, strength, and steps trigger asynchronous conditioning regeneration.
-Blend and passthrough update immediately.
+With the default persistent worker, prompt changes are typically tens of
+milliseconds after the worker has warmed. Blend and passthrough update
+immediately.
 
 `use_latest_frame` controls capture behavior:
 

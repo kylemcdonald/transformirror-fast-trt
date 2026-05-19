@@ -26,6 +26,7 @@
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -90,6 +91,9 @@ struct Args {
     std::string engine_dir = "onnx";
     std::string asset_dir = "cpp_assets";
     std::string web_root = "web";
+    std::string conditioning_backend = "worker";
+    std::string conditioning_script = "conditioning_worker.py";
+    std::string conditioning_socket;
     std::string camera_device = "/dev/video0";
     std::string capture_backend = "v4l2";
     std::string display_backend = "gl";
@@ -134,6 +138,7 @@ struct AppState {
     double capture_ms = 0.0;
     double display_ms = 0.0;
     double loop_ms = 0.0;
+    double conditioning_ms = 0.0;
     int queued_frames = 0;
     uint64_t dropped_frames = 0;
     std::string status = "starting";
@@ -141,6 +146,7 @@ struct AppState {
 };
 
 std::mutex g_state_mutex;
+std::condition_variable g_reload_cv;
 AppState g_state;
 
 std::string join_path(const std::string& a, const std::string& b) {
@@ -156,6 +162,12 @@ std::string shell_quote(const std::string& value) {
     }
     out += "'";
     return out;
+}
+
+std::string current_working_directory() {
+    char buf[4096];
+    if (!getcwd(buf, sizeof(buf))) return ".";
+    return std::string(buf);
 }
 
 void warn_errno(const std::string& what) {
@@ -212,6 +224,9 @@ Args parse_args(int argc, char** argv) {
         if (key == "--engine-dir") args.engine_dir = val("--engine-dir");
         else if (key == "--asset-dir") args.asset_dir = val("--asset-dir");
         else if (key == "--web-root") args.web_root = val("--web-root");
+        else if (key == "--conditioning-backend") args.conditioning_backend = val("--conditioning-backend");
+        else if (key == "--conditioning-script") args.conditioning_script = val("--conditioning-script");
+        else if (key == "--conditioning-socket") args.conditioning_socket = val("--conditioning-socket");
         else if (key == "--camera-device") args.camera_device = val("--camera-device");
         else if (key == "--capture-backend") args.capture_backend = val("--capture-backend");
         else if (key == "--display-backend") args.display_backend = val("--display-backend");
@@ -240,6 +255,7 @@ Args parse_args(int argc, char** argv) {
             std::cout
                 << "Usage: transformirror_fast_app [--camera-device /dev/video0]\n"
                 << "       [--engine-dir onnx] [--asset-dir cpp_assets] [--web-root web]\n"
+                << "       [--conditioning-backend worker|script] [--conditioning-script conditioning_worker.py]\n"
                 << "       [--capture-backend v4l2|ffmpeg] [--display-backend gl|ffplay|none]\n"
                 << "       [--http-port 8080] [--osc-port 9000] [--no-display]\n"
                 << "       [--realtime] [--lock-memory] [--rt-priority N]\n"
@@ -254,6 +270,13 @@ Args parse_args(int argc, char** argv) {
     }
     if (args.display_backend != "gl" && args.display_backend != "ffplay" && args.display_backend != "none") {
         throw std::runtime_error("--display-backend must be gl, ffplay, or none");
+    }
+    if (args.conditioning_backend != "worker" && args.conditioning_backend != "script") {
+        throw std::runtime_error("--conditioning-backend must be worker or script");
+    }
+    if (args.conditioning_socket.empty()) {
+        args.conditioning_socket = "/tmp/transformirror_conditioning_" +
+            std::to_string(getuid()) + "_" + std::to_string(args.http_port) + ".sock";
     }
     if (args.rt_priority < 0) args.rt_priority = 0;
     if (args.rt_priority > 95) args.rt_priority = 95;
@@ -314,13 +337,33 @@ class PinnedBuffer {
     size_t elems_ = 0;
 };
 
-void load_device_file(const std::string& path, void* device_ptr, size_t bytes) {
+struct AssetBlob {
+    std::vector<char> noise;
+    std::vector<char> prompt;
+    std::vector<char> text;
+    std::vector<char> time;
+    std::vector<char> timestep;
+    std::vector<char> params;
+};
+
+std::vector<char> read_exact_asset(const std::string& path, size_t bytes) {
     std::vector<char> data = read_file(path);
     if (data.size() != bytes) {
         throw std::runtime_error(path + " has " + std::to_string(data.size()) +
                                  " bytes, expected " + std::to_string(bytes));
     }
-    CHECK_CUDA(cudaMemcpy(device_ptr, data.data(), bytes, cudaMemcpyHostToDevice));
+    return data;
+}
+
+AssetBlob read_asset_blob(const std::string& asset_dir) {
+    AssetBlob assets;
+    assets.noise = read_exact_asset(join_path(asset_dir, "noise.fp16"), kLatentElems * sizeof(__half));
+    assets.prompt = read_exact_asset(join_path(asset_dir, "prompt_embeds.fp16"), kPromptElems * sizeof(__half));
+    assets.text = read_exact_asset(join_path(asset_dir, "text_embeds.fp16"), kTextElems * sizeof(__half));
+    assets.time = read_exact_asset(join_path(asset_dir, "time_ids.fp16"), kTimeElems * sizeof(__half));
+    assets.timestep = read_exact_asset(join_path(asset_dir, "timestep.f32"), kTimestepElems * sizeof(float));
+    assets.params = read_exact_asset(join_path(asset_dir, "params.f32"), kParamElems * sizeof(float));
+    return assets;
 }
 
 class TrtEngine {
@@ -442,13 +485,18 @@ class FastPipeline {
     }
 
     void reload_assets() {
+        AssetBlob assets = read_asset_blob(args_.asset_dir);
+        upload_assets(assets);
+    }
+
+    void upload_assets(const AssetBlob& assets) {
         std::lock_guard<std::mutex> lock(asset_mutex_);
-        load_device_file(join_path(args_.asset_dir, "noise.fp16"), d_noise_.get(), d_noise_.bytes());
-        load_device_file(join_path(args_.asset_dir, "prompt_embeds.fp16"), d_prompt_.get(), d_prompt_.bytes());
-        load_device_file(join_path(args_.asset_dir, "text_embeds.fp16"), d_text_.get(), d_text_.bytes());
-        load_device_file(join_path(args_.asset_dir, "time_ids.fp16"), d_time_.get(), d_time_.bytes());
-        load_device_file(join_path(args_.asset_dir, "timestep.f32"), d_timestep_.get(), d_timestep_.bytes());
-        load_device_file(join_path(args_.asset_dir, "params.f32"), d_params_.get(), d_params_.bytes());
+        copy_asset(assets.noise, d_noise_.get(), d_noise_.bytes());
+        copy_asset(assets.prompt, d_prompt_.get(), d_prompt_.bytes());
+        copy_asset(assets.text, d_text_.get(), d_text_.bytes());
+        copy_asset(assets.time, d_time_.get(), d_time_.bytes());
+        copy_asset(assets.timestep, d_timestep_.get(), d_timestep_.bytes());
+        copy_asset(assets.params, d_params_.get(), d_params_.bytes());
         CHECK_CUDA(cudaStreamSynchronize(stream_));
     }
 
@@ -482,6 +530,14 @@ class FastPipeline {
         unet_.bind("noise_pred", d_noise_pred_.get());
         decode_.bind("latents", d_decode_input_.get());
         decode_.bind("image", d_decoded_.get());
+    }
+
+    void copy_asset(const std::vector<char>& data, void* device_ptr, size_t bytes) {
+        if (data.size() != bytes) {
+            throw std::runtime_error("asset blob has " + std::to_string(data.size()) +
+                                     " bytes, expected " + std::to_string(bytes));
+        }
+        CHECK_CUDA(cudaMemcpyAsync(device_ptr, data.data(), bytes, cudaMemcpyHostToDevice, stream_));
     }
 
     void enqueue_graph_body() {
@@ -1215,6 +1271,7 @@ std::string state_json() {
         << "\"capture_ms\":" << g_state.capture_ms << ","
         << "\"display_ms\":" << g_state.display_ms << ","
         << "\"loop_ms\":" << g_state.loop_ms << ","
+        << "\"conditioning_ms\":" << g_state.conditioning_ms << ","
         << "\"queued_frames\":" << g_state.queued_frames << ","
         << "\"dropped_frames\":" << g_state.dropped_frames << ","
         << "\"status_text\":\"" << json_escape(status_text) << "\","
@@ -1245,6 +1302,7 @@ std::string state_json() {
         << "\"capture_ms\":" << g_state.capture_ms << ","
         << "\"display_ms\":" << g_state.display_ms << ","
         << "\"loop_ms\":" << g_state.loop_ms << ","
+        << "\"conditioning_ms\":" << g_state.conditioning_ms << ","
         << "\"queued_frames\":" << g_state.queued_frames << ","
         << "\"dropped_frames\":" << g_state.dropped_frames
         << "},"
@@ -1323,25 +1381,28 @@ bool find_bool(const std::string& body, const std::string& key, bool& value) {
 }
 
 void apply_json_state(const std::string& body) {
-    std::lock_guard<std::mutex> lock(g_state_mutex);
     std::string s;
     double n;
     bool b;
     bool reload = false;
-    if (find_string(body, "prompt", s) && s != g_state.prompt) { g_state.prompt = s; reload = true; }
-    if (find_number(body, "seed", n) && static_cast<int>(n) != g_state.seed) { g_state.seed = static_cast<int>(n); reload = true; }
-    if (find_number(body, "strength", n) && std::fabs(static_cast<float>(n) - g_state.strength) > 1e-5f) { g_state.strength = std::clamp(static_cast<float>(n), 0.0f, 1.0f); reload = true; }
-    if (find_number(body, "steps", n) && static_cast<int>(n) != g_state.steps) { g_state.steps = std::clamp(static_cast<int>(n), 1, 8); reload = true; }
-    if (find_number(body, "blend", n)) g_state.blend = std::clamp(static_cast<float>(n), 0.0f, 1.0f);
-    if (find_bool(body, "passthrough", b)) g_state.passthrough = b;
-    if (find_bool(body, "use_latest_frame", b)) g_state.use_latest_frame = b;
-    if (find_string(body, "frame_mode", s)) g_state.use_latest_frame = (s != "fifo" && s != "no_drop");
-    if (find_number(body, "width", n) && static_cast<int>(n) != kWidth) g_state.status = "resolution requires matching TensorRT engines; using 1024x1024";
-    if (find_number(body, "height", n) && static_cast<int>(n) != kHeight) g_state.status = "resolution requires matching TensorRT engines; using 1024x1024";
-    if (reload) {
-        g_state.reload_requested = true;
-        g_state.status = "conditioning reload queued";
+    {
+        std::lock_guard<std::mutex> lock(g_state_mutex);
+        if (find_string(body, "prompt", s) && s != g_state.prompt) { g_state.prompt = s; reload = true; }
+        if (find_number(body, "seed", n) && static_cast<int>(n) != g_state.seed) { g_state.seed = static_cast<int>(n); reload = true; }
+        if (find_number(body, "strength", n) && std::fabs(static_cast<float>(n) - g_state.strength) > 1e-5f) { g_state.strength = std::clamp(static_cast<float>(n), 0.0f, 1.0f); reload = true; }
+        if (find_number(body, "steps", n) && static_cast<int>(n) != g_state.steps) { g_state.steps = std::clamp(static_cast<int>(n), 1, 8); reload = true; }
+        if (find_number(body, "blend", n)) g_state.blend = std::clamp(static_cast<float>(n), 0.0f, 1.0f);
+        if (find_bool(body, "passthrough", b)) g_state.passthrough = b;
+        if (find_bool(body, "use_latest_frame", b)) g_state.use_latest_frame = b;
+        if (find_string(body, "frame_mode", s)) g_state.use_latest_frame = (s != "fifo" && s != "no_drop");
+        if (find_number(body, "width", n) && static_cast<int>(n) != kWidth) g_state.status = "resolution requires matching TensorRT engines; using 1024x1024";
+        if (find_number(body, "height", n) && static_cast<int>(n) != kHeight) g_state.status = "resolution requires matching TensorRT engines; using 1024x1024";
+        if (reload) {
+            g_state.reload_requested = true;
+            g_state.status = "conditioning reload queued";
+        }
     }
+    if (reload) g_reload_cv.notify_one();
 }
 
 bool use_latest_frame_mode() {
@@ -1554,13 +1615,176 @@ void osc_thread(int port, int core, int rt_priority) {
     close(sock);
 }
 
+bool send_all_fd(int fd, const std::string& data) {
+    size_t sent = 0;
+    while (sent < data.size()) {
+        ssize_t n = send(fd, data.data() + sent, data.size() - sent, 0);
+        if (n <= 0) return false;
+        sent += static_cast<size_t>(n);
+    }
+    return true;
+}
+
+std::string recv_line_fd(int fd) {
+    std::string out;
+    char buf[4096];
+    while (true) {
+        ssize_t n = recv(fd, buf, sizeof(buf), 0);
+        if (n <= 0) break;
+        out.append(buf, static_cast<size_t>(n));
+        size_t newline = out.find('\n');
+        if (newline != std::string::npos) {
+            out.resize(newline);
+            break;
+        }
+    }
+    return out;
+}
+
+int connect_unix_socket(const std::string& path) {
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    if (path.size() >= sizeof(addr.sun_path)) {
+        close(fd);
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    std::strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
+    if (connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+std::string conditioning_request_json(const AppState& state) {
+    std::ostringstream req;
+    req << "{"
+        << "\"prompt\":\"" << json_escape(state.prompt) << "\","
+        << "\"seed\":" << state.seed << ","
+        << "\"strength\":" << state.strength << ","
+        << "\"steps\":" << state.steps << ","
+        << "\"width\":" << state.width << ","
+        << "\"height\":" << state.height
+        << "}\n";
+    return req.str();
+}
+
+class ConditioningWorkerClient {
+  public:
+    explicit ConditioningWorkerClient(const Args& args) : args_(args) {}
+
+    void start_async() {
+        if (started_) return;
+        started_ = true;
+        unlink(args_.conditioning_socket.c_str());
+        std::ostringstream cmd;
+        cmd << "cd " << shell_quote(current_working_directory()) << " && "
+            << shell_quote(args_.python) << " " << shell_quote(args_.conditioning_script)
+            << " --socket " << shell_quote(args_.conditioning_socket)
+            << " --out-dir " << shell_quote(args_.asset_dir)
+            << " --width " << kWidth
+            << " --height " << kHeight
+            << " --parent-pid " << getpid()
+            << " >/tmp/transformirror_conditioning_worker.log 2>&1 &";
+        int rc = std::system(cmd.str().c_str());
+        if (rc != 0) {
+            throw std::runtime_error("failed to launch conditioning worker");
+        }
+    }
+
+    bool wait_ready(double timeout_sec) {
+        auto deadline = std::chrono::steady_clock::now() +
+            std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(timeout_sec));
+        while (g_running.load() && std::chrono::steady_clock::now() < deadline) {
+            if (access(args_.conditioning_socket.c_str(), F_OK) == 0) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        return false;
+    }
+
+    bool request(const AppState& state, std::string& response, std::string& error) {
+        start_async();
+        int fd = connect_unix_socket(args_.conditioning_socket);
+        if (fd < 0) {
+            if (!wait_ready(20.0)) {
+                error = "conditioning worker did not become ready; see /tmp/transformirror_conditioning_worker.log";
+                return false;
+            }
+            fd = connect_unix_socket(args_.conditioning_socket);
+            if (fd < 0) {
+                error = std::string("connect conditioning worker failed: ") + std::strerror(errno);
+                return false;
+            }
+        }
+
+        bool ok = send_all_fd(fd, conditioning_request_json(state));
+        if (ok) response = recv_line_fd(fd);
+        close(fd);
+        if (!ok || response.empty()) {
+            error = "conditioning worker returned an empty response";
+            return false;
+        }
+        bool worker_ok = false;
+        if (!find_bool(response, "ok", worker_ok) || !worker_ok) {
+            std::string worker_error;
+            find_string(response, "error", worker_error);
+            error = worker_error.empty() ? response : worker_error;
+            return false;
+        }
+        return true;
+    }
+
+  private:
+    const Args& args_;
+    bool started_ = false;
+};
+
+bool run_script_conditioning(const Args& args, const AppState& snapshot) {
+    std::ostringstream cmd;
+    cmd << shell_quote(args.python) << " export_cpp_assets.py"
+        << " --out-dir " << shell_quote(args.asset_dir)
+        << " --prompt " << shell_quote(snapshot.prompt)
+        << " --seed " << snapshot.seed
+        << " --strength " << snapshot.strength
+        << " --steps " << snapshot.steps
+        << " >/tmp/transformirror_fast_assets.log 2>&1";
+    return std::system(cmd.str().c_str()) == 0;
+}
+
 void asset_reload_thread(const Args& args, FastPipeline* pipeline) {
     configure_current_thread("asset-reload", args.reload_core, 0);
+    std::unique_ptr<ConditioningWorkerClient> worker;
+    if (args.conditioning_backend == "worker") {
+        worker.reset(new ConditioningWorkerClient(args));
+        {
+            std::lock_guard<std::mutex> lock(g_state_mutex);
+            g_state.status = "conditioning worker warming";
+        }
+        try {
+            worker->start_async();
+            if (worker->wait_ready(30.0)) {
+                std::lock_guard<std::mutex> lock(g_state_mutex);
+                if (!g_state.reload_requested) g_state.status = "conditioning worker ready";
+            } else {
+                std::lock_guard<std::mutex> lock(g_state_mutex);
+                g_state.status = "conditioning worker warmup timed out";
+            }
+        } catch (const std::exception& e) {
+            std::lock_guard<std::mutex> lock(g_state_mutex);
+            g_state.status = std::string("conditioning worker launch failed: ") + e.what();
+        }
+    }
     while (g_running.load()) {
         bool reload = false;
         AppState snapshot;
         {
-            std::lock_guard<std::mutex> lock(g_state_mutex);
+            std::unique_lock<std::mutex> lock(g_state_mutex);
+            g_reload_cv.wait_for(lock, std::chrono::milliseconds(250), [] {
+                return !g_running.load() || g_state.reload_requested;
+            });
             if (g_state.reload_requested) {
                 reload = true;
                 g_state.reload_requested = false;
@@ -1569,30 +1793,39 @@ void asset_reload_thread(const Args& args, FastPipeline* pipeline) {
             }
         }
         if (reload) {
-            std::ostringstream cmd;
-            cmd << shell_quote(args.python) << " export_cpp_assets.py"
-                << " --out-dir " << shell_quote(args.asset_dir)
-                << " --prompt " << shell_quote(snapshot.prompt)
-                << " --seed " << snapshot.seed
-                << " --strength " << snapshot.strength
-                << " --steps " << snapshot.steps
-                << " >/tmp/transformirror_fast_assets.log 2>&1";
-            int rc = std::system(cmd.str().c_str());
-            if (rc == 0) {
+            auto started = std::chrono::steady_clock::now();
+            bool generated = false;
+            std::string response;
+            std::string error;
+            if (worker) {
+                generated = worker->request(snapshot, response, error);
+            } else {
+                generated = run_script_conditioning(args, snapshot);
+                if (!generated) error = "asset regeneration failed; see /tmp/transformirror_fast_assets.log";
+            }
+            if (generated) {
                 try {
-                    pipeline->reload_assets();
+                    AssetBlob assets = read_asset_blob(args.asset_dir);
+                    pipeline->upload_assets(assets);
+                    double total_ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - started).count();
+                    double worker_ms = total_ms;
+                    find_number(response, "elapsed_ms", worker_ms);
                     std::lock_guard<std::mutex> lock(g_state_mutex);
-                    g_state.status = "conditioning assets reloaded";
+                    g_state.conditioning_ms = total_ms;
+                    g_state.status = "conditioning assets reloaded in " +
+                        std::to_string(static_cast<int>(std::round(total_ms))) +
+                        " ms (worker " +
+                        std::to_string(static_cast<int>(std::round(worker_ms))) + " ms)";
                 } catch (const std::exception& e) {
                     std::lock_guard<std::mutex> lock(g_state_mutex);
                     g_state.status = std::string("asset reload failed: ") + e.what();
                 }
             } else {
                 std::lock_guard<std::mutex> lock(g_state_mutex);
-                g_state.status = "asset regeneration failed; see /tmp/transformirror_fast_assets.log";
+                g_state.status = error.empty() ? "asset regeneration failed" : error;
             }
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 }
 

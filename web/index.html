@@ -287,6 +287,7 @@
           <div class="status-label">Status</div><div class="status-value" id="modelReady">-</div>
           <div class="status-label">Resolution</div><div class="status-value" id="resolution">-</div>
           <div class="status-label">Time</div><div class="status-value" id="diffusionMs">-</div>
+          <div class="status-label">Conditioning</div><div class="status-value" id="conditioningMs">-</div>
           <div class="status-label">FPS</div><div class="status-value" id="diffusionFps">-</div>
 
           <div class="status-group">Network</div>
@@ -392,6 +393,7 @@
       $("cameraFps").textContent = state.stats.camera_fps.toFixed(2);
       $("displayFps").textContent = state.stats.display_fps.toFixed(2);
       $("diffusionMs").textContent = `${state.stats.diffusion_ms.toFixed(1)} ms`;
+      $("conditioningMs").textContent = `${(state.stats.conditioning_ms || 0).toFixed(1)} ms`;
       $("diffusionFps").textContent = changingSize ? "Changing size" : state.stats.diffusion_fps.toFixed(2);
       $("oscPort").textContent = state.config.osc_port;
       $("httpPort").textContent = state.config.http_port;
