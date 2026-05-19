@@ -253,9 +253,11 @@ Implemented low-level latency controls:
 
 The default display backend is `gl`, implemented with GLX, an OpenGL pixel
 buffer object, and CUDA graphics interop. It defaults to `--gl-sync vsync` to
-avoid visible tearing at scanout. Use `--gl-sync off` for the lowest presentation
-latency when tearing is acceptable. Use `--display-backend ffplay` as a fallback
-if X11/OpenGL is unavailable.
+avoid visible tearing at scanout. In vsync mode the app also requests compositor
+bypass for the fullscreen X11 window and uses `GLX_SGI_video_sync` when the
+driver exposes it. Use `--gl-sync off` for the lowest presentation latency when
+tearing is acceptable. Use `--display-backend ffplay` as a fallback if X11/OpenGL
+is unavailable.
 
 ## Resolution Notes
 

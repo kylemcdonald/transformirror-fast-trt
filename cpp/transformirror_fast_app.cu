@@ -903,6 +903,7 @@ class GlDisplay {
         glTexCoord2f(1.0f, 0.0f); glVertex2f(1.0f, 1.0f);
         glEnd();
 
+        wait_for_vblank();
         glXSwapBuffers(display_, window_);
         return true;
     }
@@ -911,6 +912,8 @@ class GlDisplay {
     using GlXSwapIntervalExtFn = void (*)(Display*, GLXDrawable, int);
     using GlXSwapIntervalMesaFn = int (*)(unsigned int);
     using GlXSwapIntervalSgiFn = int (*)(int);
+    using GlXGetVideoSyncSgiFn = int (*)(unsigned int*);
+    using GlXWaitVideoSyncSgiFn = int (*)(int, int, unsigned int*);
 
     void open_display() {
         display_ = XOpenDisplay(nullptr);
@@ -957,6 +960,14 @@ class GlDisplay {
         Atom wm_state = XInternAtom(display_, "_NET_WM_STATE", False);
         Atom fullscreen = XInternAtom(display_, "_NET_WM_STATE_FULLSCREEN", False);
         XChangeProperty(display_, window_, wm_state, XA_ATOM, 32, PropModeReplace, reinterpret_cast<unsigned char*>(&fullscreen), 1);
+        Atom bypass_compositor = XInternAtom(display_, "_NET_WM_BYPASS_COMPOSITOR", False);
+        unsigned long bypass_value = 1;
+        XChangeProperty(display_, window_, bypass_compositor, XA_CARDINAL, 32, PropModeReplace,
+                        reinterpret_cast<unsigned char*>(&bypass_value), 1);
+        Atom opaque_region = XInternAtom(display_, "_NET_WM_OPAQUE_REGION", False);
+        unsigned long opaque[] = {0, 0, static_cast<unsigned long>(window_width_), static_cast<unsigned long>(window_height_)};
+        XChangeProperty(display_, window_, opaque_region, XA_CARDINAL, 32, PropModeReplace,
+                        reinterpret_cast<unsigned char*>(opaque), 4);
         XStoreName(display_, window_, "Transformirror Fast");
         XMapRaised(display_, window_);
 
@@ -1013,9 +1024,23 @@ class GlDisplay {
     void configure_swap_sync() {
         int interval = sync_mode_ == "off" ? 0 : 1;
         bool ok = set_swap_interval(interval);
+        if (sync_mode_ != "off") {
+            get_video_sync_ = reinterpret_cast<GlXGetVideoSyncSgiFn>(
+                glXGetProcAddressARB(reinterpret_cast<const GLubyte*>("glXGetVideoSyncSGI")));
+            wait_video_sync_ = reinterpret_cast<GlXWaitVideoSyncSgiFn>(
+                glXGetProcAddressARB(reinterpret_cast<const GLubyte*>("glXWaitVideoSyncSGI")));
+        }
         std::cerr << "display: gl swap sync " << sync_mode_
                   << " interval " << interval
+                  << " video_sync " << (wait_video_sync_ ? "available" : "unavailable")
                   << (ok ? "" : " (not supported by GLX)") << "\n";
+    }
+
+    void wait_for_vblank() {
+        if (sync_mode_ == "off" || !get_video_sync_ || !wait_video_sync_) return;
+        unsigned int count = 0;
+        if (get_video_sync_(&count) != 0) return;
+        wait_video_sync_(2, static_cast<int>((count + 1) % 2), &count);
     }
 
     void register_cuda_pbo() {
@@ -1053,6 +1078,8 @@ class GlDisplay {
     GLuint texture_ = 0;
     GLuint pbo_ = 0;
     cudaGraphicsResource* cuda_resource_ = nullptr;
+    GlXGetVideoSyncSgiFn get_video_sync_ = nullptr;
+    GlXWaitVideoSyncSgiFn wait_video_sync_ = nullptr;
 };
 
 bool read_exact(FILE* file, uint8_t* dst, size_t bytes) {
