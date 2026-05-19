@@ -313,7 +313,18 @@
       $("status").textContent = text;
     }
 
+    function isFocused(...ids) {
+      return ids.some((id) => document.activeElement === $(id));
+    }
+
+    function setValueIfIdle(id, value) {
+      if (!isFocused(id)) {
+        $(id).value = value;
+      }
+    }
+
     function setPair(rangeId, numberId, value) {
+      if (isFocused(rangeId, numberId)) return;
       $(rangeId).value = value;
       $(numberId).value = value;
     }
@@ -358,14 +369,16 @@
     function render(state, keepPromptFocus = false) {
       applyingRemote = true;
       const controls = state.controls;
-      if (!(keepPromptFocus && document.activeElement === $("prompt"))) {
+      if (!isFocused("prompt") && !(keepPromptFocus && document.activeElement === $("prompt"))) {
         $("prompt").value = controls.prompt;
       }
       setPair("strength", "strengthNumber", controls.strength);
       setPair("blend", "blendNumber", controls.blend);
-      $("width").value = state.config.width;
-      $("height").value = state.config.height;
-      $("seed").value = controls.seed;
+      if (!isFocused("width", "height")) {
+        $("width").value = state.config.width;
+        $("height").value = state.config.height;
+      }
+      setValueIfIdle("seed", controls.seed);
       setPair("steps", "stepsNumber", controls.steps);
 
       const changingSize = state.status.resolution_changing && state.stats.diffusion_fps === 0;

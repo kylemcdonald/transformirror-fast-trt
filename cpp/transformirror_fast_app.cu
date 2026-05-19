@@ -1267,10 +1267,31 @@ bool find_string(const std::string& body, const std::string& key, std::string& v
     if (p == std::string::npos) return false;
     p = body.find('"', p);
     if (p == std::string::npos) return false;
-    size_t e = body.find('"', p + 1);
-    if (e == std::string::npos) return false;
-    value = body.substr(p + 1, e - p - 1);
-    return true;
+    std::string out;
+    bool escaped = false;
+    for (size_t i = p + 1; i < body.size(); ++i) {
+        char c = body[i];
+        if (escaped) {
+            switch (c) {
+                case 'n': out += '\n'; break;
+                case 'r': out += '\r'; break;
+                case 't': out += '\t'; break;
+                case '"': out += '"'; break;
+                case '\\': out += '\\'; break;
+                case '/': out += '/'; break;
+                default: out += c; break;
+            }
+            escaped = false;
+        } else if (c == '\\') {
+            escaped = true;
+        } else if (c == '"') {
+            value = out;
+            return true;
+        } else {
+            out += c;
+        }
+    }
+    return false;
 }
 
 bool find_number(const std::string& body, const std::string& key, double& value) {
@@ -1338,6 +1359,7 @@ void send_http(int client, const std::string& code, const std::string& type, con
     std::ostringstream res;
     res << "HTTP/1.1 " << code << "\r\nContent-Type: " << type
         << "\r\nContent-Length: " << body.size()
+        << "\r\nCache-Control: no-store"
         << "\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n" << body;
     std::string text = res.str();
     send(client, text.data(), text.size(), 0);
@@ -1413,6 +1435,20 @@ int bind_udp_any(int port) {
     return sock;
 }
 
+size_t http_content_length(const std::string& req) {
+    size_t p = req.find("Content-Length:");
+    if (p == std::string::npos) p = req.find("content-length:");
+    if (p == std::string::npos) return 0;
+    p = req.find(':', p);
+    if (p == std::string::npos) return 0;
+    ++p;
+    while (p < req.size() && std::isspace(static_cast<unsigned char>(req[p]))) ++p;
+    size_t e = p;
+    while (e < req.size() && std::isdigit(static_cast<unsigned char>(req[e]))) ++e;
+    if (e == p) return 0;
+    return static_cast<size_t>(std::stoul(req.substr(p, e - p)));
+}
+
 void http_thread(int port, int core, int rt_priority, std::string web_root) {
     configure_current_thread("http", core, rt_priority > 0 ? 1 : 0);
     int server = bind_tcp_any(port);
@@ -1432,7 +1468,16 @@ void http_thread(int port, int core, int rt_priority, std::string web_root) {
         bool get = req.rfind("GET ", 0) == 0;
         std::string body;
         size_t body_pos = req.find("\r\n\r\n");
-        if (body_pos != std::string::npos) body = req.substr(body_pos + 4);
+        if (body_pos != std::string::npos) {
+            size_t header_bytes = body_pos + 4;
+            size_t content_length = http_content_length(req);
+            while (content_length > 0 && req.size() < header_bytes + content_length) {
+                n = recv(client, buf, sizeof(buf) - 1, 0);
+                if (n <= 0) break;
+                req.append(buf, static_cast<size_t>(n));
+            }
+            body = req.substr(header_bytes, content_length > 0 ? content_length : std::string::npos);
+        }
         if (get && req.find("GET /api/state ") == 0) send_http(client, "200 OK", "application/json", state_json());
         else if (post && req.find("POST /api/state ") == 0) { apply_json_state(body); send_http(client, "200 OK", "application/json", state_json()); }
         else if (get && (req.find("GET / ") == 0 || req.find("GET /index.html ") == 0)) {
