@@ -28,6 +28,7 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -963,6 +964,98 @@ std::string ffplay_display_cmd() {
         << "-f rawvideo -pixel_format rgb24 -video_size " << kWidth << "x" << kHeight
         << " -framerate 30 -i pipe:0 -fs -noborder -autoexit";
     return cmd.str();
+}
+
+struct ProcessPipe {
+    FILE* file = nullptr;
+    pid_t pid = -1;
+
+    void terminate() const {
+        if (pid > 0) kill(-pid, SIGTERM);
+    }
+
+    void close_file() {
+        if (file) {
+            fclose(file);
+            file = nullptr;
+        }
+    }
+
+    void wait(double timeout_seconds = 1.0) {
+        if (pid <= 0) return;
+        int status = 0;
+        auto deadline = std::chrono::steady_clock::now() +
+            std::chrono::duration<double>(timeout_seconds);
+        while (true) {
+            pid_t rc = waitpid(pid, &status, WNOHANG);
+            if (rc == pid || (rc < 0 && errno == ECHILD)) {
+                pid = -1;
+                return;
+            }
+            if (std::chrono::steady_clock::now() >= deadline) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        kill(-pid, SIGKILL);
+        waitpid(pid, &status, 0);
+        pid = -1;
+    }
+
+    void close() {
+        close_file();
+        wait();
+    }
+};
+
+ProcessPipe open_process_pipe(const std::string& cmd, const char* mode) {
+    if (!mode || (mode[0] != 'r' && mode[0] != 'w')) {
+        throw std::runtime_error("process pipe mode must be r or w");
+    }
+    int fds[2];
+    if (pipe(fds) != 0) {
+        throw std::runtime_error("pipe failed: " + std::string(std::strerror(errno)));
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        int err = errno;
+        ::close(fds[0]);
+        ::close(fds[1]);
+        throw std::runtime_error("fork failed: " + std::string(std::strerror(err)));
+    }
+
+    if (pid == 0) {
+        setpgid(0, 0);
+        if (mode[0] == 'r') {
+            dup2(fds[1], STDOUT_FILENO);
+        } else {
+            dup2(fds[0], STDIN_FILENO);
+        }
+        ::close(fds[0]);
+        ::close(fds[1]);
+        execl("/bin/sh", "sh", "-c", cmd.c_str(), static_cast<char*>(nullptr));
+        _exit(127);
+    }
+
+    setpgid(pid, pid);
+    int parent_fd = -1;
+    if (mode[0] == 'r') {
+        ::close(fds[1]);
+        parent_fd = fds[0];
+    } else {
+        ::close(fds[0]);
+        parent_fd = fds[1];
+    }
+    set_close_on_exec(parent_fd);
+    FILE* file = fdopen(parent_fd, mode);
+    if (!file) {
+        int err = errno;
+        ::close(parent_fd);
+        kill(-pid, SIGTERM);
+        int status = 0;
+        waitpid(pid, &status, 0);
+        throw std::runtime_error("fdopen failed: " + std::string(std::strerror(err)));
+    }
+    return {file, pid};
 }
 
 class GlDisplay {
@@ -2448,6 +2541,7 @@ int main(int argc, char** argv) {
         resolver.detach();
 
         FILE* camera = nullptr;
+        ProcessPipe camera_process;
         std::unique_ptr<CaptureReader> ffmpeg_capture;
         std::unique_ptr<V4L2CaptureReader> v4l2_capture;
         if (args.capture_backend == "v4l2") {
@@ -2458,7 +2552,8 @@ int main(int argc, char** argv) {
         } else {
             std::string cap_cmd = ffmpeg_capture_cmd(args);
             std::cerr << "camera: " << cap_cmd << "\n";
-            camera = popen(cap_cmd.c_str(), "r");
+            camera_process = open_process_pipe(cap_cmd, "r");
+            camera = camera_process.file;
             if (!camera) throw std::runtime_error("failed to start ffmpeg camera");
             ffmpeg_capture.reset(new CaptureReader(camera, pipeline.rgb_bytes(), args.capture_core, args.rt_priority));
         }
@@ -2468,11 +2563,13 @@ int main(int argc, char** argv) {
         };
 
         FILE* display = nullptr;
+        ProcessPipe display_process;
         std::unique_ptr<GlDisplay> gl_display;
         if (args.display_backend == "ffplay") {
             std::string display_cmd = ffplay_display_cmd();
             std::cerr << "display: " << display_cmd << "\n";
-            display = popen(display_cmd.c_str(), "w");
+            display_process = open_process_pipe(display_cmd, "w");
+            display = display_process.file;
             if (!display) throw std::runtime_error("failed to start ffplay display");
         } else if (args.display_backend == "gl") {
             gl_display.reset(new GlDisplay(pipeline.rgb_bytes(), args.gl_sync));
@@ -2515,13 +2612,15 @@ int main(int argc, char** argv) {
             }
         }
         g_running.store(false);
+        camera_process.terminate();
+        display_process.terminate();
         if (v4l2_capture) v4l2_capture->stop();
         if (ffmpeg_capture) ffmpeg_capture->stop();
         gl_display.reset();
         v4l2_capture.reset();
         ffmpeg_capture.reset();
-        if (camera) pclose(camera);
-        if (display) pclose(display);
+        camera_process.close();
+        display_process.close();
         if (reexec_if_requested(args)) return 1;
         return 0;
     } catch (const std::exception& e) {
