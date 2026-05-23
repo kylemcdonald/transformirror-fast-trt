@@ -6,7 +6,7 @@
   "camera_fps": 30,
   "display_index": 0,
   "fullscreen": true,
-  "mirror": true,
+  "left_right_flip": true,
   "prompt": "a cinematic mirror portrait, luminous, detailed, surreal",
   "seed": 0,
   "strength": 0.7,

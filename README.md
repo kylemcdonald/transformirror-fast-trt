@@ -231,15 +231,15 @@ Update:
 ```bash
 curl -X POST http://localhost:8080/api/state \
   -H 'Content-Type: application/json' \
-  -d '{"prompt":"a neon mirror portrait","seed":42,"strength":0.7,"steps":2,"blend":0.5,"use_latest_frame":true}'
+  -d '{"prompt":"a neon mirror portrait","seed":42,"strength":0.7,"steps":2,"blend":0.5,"left_right_flip":true,"use_latest_frame":true}'
 ```
 
 Prompt, seed, strength, and steps trigger asynchronous conditioning regeneration.
 With the default persistent worker, prompt changes are typically tens of
 milliseconds after the worker has warmed. `steps` accepts `2..8`; SDXL Turbo
 img2img may resolve that to fewer effective denoise passes depending on
-`strength`, and each extra effective pass adds another UNet call. Blend and
-passthrough update immediately.
+`strength`, and each extra effective pass adds another UNet call. Blend,
+passthrough, and left-right flip update immediately.
 
 Changing `width` or `height` queues a background build for a matching
 fixed-shape TensorRT app. The current app keeps running during the build, then
@@ -266,13 +266,15 @@ Supported addresses:
 /steps         int
 /blend         float
 /passthrough   int/bool
+/left_right_flip int/bool
 /use_latest_frame int/bool
 /frame_mode    string, "latest" or "fifo"
 /width         int
 /height        int
 ```
 
-Namespaced versions also work, for example `/transformirror/blend`.
+Namespaced versions also work, for example `/transformirror/blend`. `/mirror`
+is accepted as an alias for `/left_right_flip`.
 
 ## Latency Notes
 

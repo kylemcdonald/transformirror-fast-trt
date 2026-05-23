@@ -136,6 +136,7 @@ struct Args {
     bool has_initial_blend = false;
     bool has_initial_passthrough = false;
     bool has_initial_use_latest_frame = false;
+    bool has_initial_left_right_flip = false;
     std::string initial_prompt;
     int initial_seed = 0;
     float initial_strength = 0.7f;
@@ -143,6 +144,7 @@ struct Args {
     float initial_blend = 1.0f;
     bool initial_passthrough = false;
     bool initial_use_latest_frame = true;
+    bool initial_left_right_flip = true;
 };
 
 struct AppState {
@@ -153,6 +155,7 @@ struct AppState {
     float blend = 1.0f;
     bool passthrough = false;
     bool use_latest_frame = true;
+    bool left_right_flip = true;
     int width = kWidth;
     int height = kHeight;
     int http_port = 8080;
@@ -391,6 +394,16 @@ void try_lock_process_memory() {
     warn_errno("mlockall");
 }
 
+bool parse_bool_arg(const std::string& raw, const char* name) {
+    std::string value = trim_copy(raw);
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    if (value == "1" || value == "true" || value == "yes" || value == "on") return true;
+    if (value == "0" || value == "false" || value == "no" || value == "off") return false;
+    throw std::runtime_error(std::string(name) + " expects 1/0, true/false, yes/no, or on/off");
+}
+
 Args parse_args(int argc, char** argv) {
     Args args;
     for (int i = 1; i < argc; ++i) {
@@ -428,8 +441,9 @@ Args parse_args(int argc, char** argv) {
         else if (key == "--initial-strength") { args.initial_strength = std::stof(val("--initial-strength")); args.has_initial_strength = true; }
         else if (key == "--initial-steps") { args.initial_steps = std::stoi(val("--initial-steps")); args.has_initial_steps = true; }
         else if (key == "--initial-blend") { args.initial_blend = std::stof(val("--initial-blend")); args.has_initial_blend = true; }
-        else if (key == "--initial-passthrough") { args.initial_passthrough = std::stoi(val("--initial-passthrough")) != 0; args.has_initial_passthrough = true; }
-        else if (key == "--initial-use-latest-frame") { args.initial_use_latest_frame = std::stoi(val("--initial-use-latest-frame")) != 0; args.has_initial_use_latest_frame = true; }
+        else if (key == "--initial-passthrough") { args.initial_passthrough = parse_bool_arg(val("--initial-passthrough"), "--initial-passthrough"); args.has_initial_passthrough = true; }
+        else if (key == "--initial-use-latest-frame") { args.initial_use_latest_frame = parse_bool_arg(val("--initial-use-latest-frame"), "--initial-use-latest-frame"); args.has_initial_use_latest_frame = true; }
+        else if (key == "--initial-left-right-flip" || key == "--initial-mirror") { args.initial_left_right_flip = parse_bool_arg(val(key.c_str()), key.c_str()); args.has_initial_left_right_flip = true; }
         else if (key == "--lock-memory") args.lock_memory = true;
         else if (key == "--realtime") {
             args.lock_memory = true;
@@ -446,6 +460,7 @@ Args parse_args(int argc, char** argv) {
                 << "       [--capture-backend v4l2|ffmpeg] [--display-backend gl|ffplay|none]\n"
                 << "       [--gl-sync off|vsync|strict] [--nvidia-full-composition auto|on|off]\n"
                 << "       [--http-port 8080] [--osc-port 9000] [--no-display]\n"
+                << "       [--initial-left-right-flip true|false]\n"
                 << "       [--realtime] [--lock-memory] [--rt-priority N]\n"
                 << "       [--main-core N] [--capture-core N] [--http-core N]\n";
             std::exit(0);
@@ -488,6 +503,7 @@ void apply_initial_state(const Args& args) {
     if (args.has_initial_blend) g_state.blend = std::clamp(args.initial_blend, 0.0f, 1.0f);
     if (args.has_initial_passthrough) g_state.passthrough = args.initial_passthrough;
     if (args.has_initial_use_latest_frame) g_state.use_latest_frame = args.initial_use_latest_frame;
+    if (args.has_initial_left_right_flip) g_state.left_right_flip = args.initial_left_right_flip;
 }
 
 std::vector<char> read_file(const std::string& path) {
@@ -752,6 +768,20 @@ __global__ void compose_rgb_kernel(
     dst_rgb[base + 2] = static_cast<uint8_t>(fminf(255.0f, fmaxf(0.0f, 255.0f * (source_b * (1.0f - blend) + out_b * blend))));
 }
 
+void flip_rgb_horizontal(uint8_t* rgb) {
+    constexpr int row_stride = kWidth * 3;
+    for (int y = 0; y < kHeight; ++y) {
+        uint8_t* row = rgb + y * row_stride;
+        for (int x = 0; x < kWidth / 2; ++x) {
+            uint8_t* left = row + x * 3;
+            uint8_t* right = row + (kWidth - 1 - x) * 3;
+            std::swap(left[0], right[0]);
+            std::swap(left[1], right[1]);
+            std::swap(left[2], right[2]);
+        }
+    }
+}
+
 class FastPipeline {
   public:
     FastPipeline(const Args& args, Logger& logger)
@@ -817,7 +847,8 @@ class FastPipeline {
     }
 
     float process_frame(bool need_host_output) {
-        update_state_controls();
+        const bool left_right_flip = update_state_controls();
+        if (left_right_flip) flip_rgb_horizontal(h_src_rgb_.get());
         CHECK_CUDA(cudaEventRecord(start_event_, stream_));
         CHECK_CUDA(cudaMemcpyAsync(d_src_rgb_.get(), h_src_rgb_.get(), h_src_rgb_.bytes(), cudaMemcpyHostToDevice, stream_));
         {
@@ -918,15 +949,18 @@ class FastPipeline {
         CHECK_CUDA(cudaStreamSynchronize(stream_));
     }
 
-    void update_state_controls() {
+    bool update_state_controls() {
         float blend = 1.0f;
         bool passthrough = false;
+        bool left_right_flip = true;
         {
             std::lock_guard<std::mutex> lock(g_state_mutex);
             blend = g_state.blend;
             passthrough = g_state.passthrough;
+            left_right_flip = g_state.left_right_flip;
         }
         update_blend(blend, passthrough);
+        return left_right_flip;
     }
 
     const Args& args_;
@@ -1697,23 +1731,24 @@ input[type=range]{width:100%}textarea{width:100%;height:88px}button{cursor:point
 <label>Strength</label><div class="row"><input id="strength" type="range" min="0" max="1" step="0.01"><span id="strengthv"></span></div>
 <label>Steps</label><input id="steps" type="number" min="1" max="8">
 <label>Blend</label><div class="row"><input id="blend" type="range" min="0" max="1" step="0.01"><span id="blendv"></span></div>
+<label><input id="left_right_flip" type="checkbox"> Left-right flip</label>
 <label><input id="passthrough" type="checkbox"> Passthrough</label>
 <label>Frame handling</label><select id="frame_mode"><option value="latest">Always use newest frame</option><option value="fifo">Do not drop frames</option></select>
 <label>Resolution</label><input id="resolution" value="1024x1024">
 <p><button id="apply">Apply</button></p>
 <script>
 const ui={};
-for (const id of ['status','prompt','seed','strength','strengthv','steps','blend','blendv','passthrough','frame_mode','resolution','apply']) ui[id]=document.getElementById(id);
+for (const id of ['status','prompt','seed','strength','strengthv','steps','blend','blendv','left_right_flip','passthrough','frame_mode','resolution','apply']) ui[id]=document.getElementById(id);
 async function getState(){const r=await fetch('/api/state',{cache:'no-store'});if(!r.ok)throw new Error(`HTTP ${r.status}`);return await r.json()}
 function statusLine(s){return `${s.status_text || s.status?.message || 'running'} | ${s.fps.toFixed(1)} fps | model ${s.frame_ms.toFixed(2)} ms | capture ${s.capture_ms.toFixed(2)} ms | display ${s.display_ms.toFixed(2)} ms | loop ${s.loop_ms.toFixed(2)} ms | queued ${s.queued_frames} | dropped ${s.dropped_frames}`}
 function fill(s){ui.status.textContent=statusLine(s);
 ui.prompt.value=s.prompt;ui.seed.value=s.seed;ui.strength.value=s.strength;ui.strengthv.textContent=s.strength.toFixed(2);
-ui.steps.value=s.steps;ui.blend.value=s.blend;ui.blendv.textContent=s.blend.toFixed(2);ui.passthrough.checked=s.passthrough;
+ui.steps.value=s.steps;ui.blend.value=s.blend;ui.blendv.textContent=s.blend.toFixed(2);ui.left_right_flip.checked=s.left_right_flip;ui.passthrough.checked=s.passthrough;
 ui.frame_mode.value=s.use_latest_frame?'latest':'fifo';
 ui.resolution.value=`${s.width}x${s.height}`}
 async function refresh(){try{ui.status.textContent=statusLine(await getState())}catch(e){ui.status.textContent=`error: ${e.message}`}}
 for (const id of ['strength','blend']) ui[id].oninput=()=>ui[id+'v'].textContent=(+ui[id].value).toFixed(2);
-ui.apply.onclick=async()=>{let [w,h]=ui.resolution.value.split('x').map(Number);await fetch('/api/state',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:ui.prompt.value,seed:+ui.seed.value,strength:+ui.strength.value,steps:+ui.steps.value,blend:+ui.blend.value,passthrough:ui.passthrough.checked,use_latest_frame:ui.frame_mode.value==='latest',width:w||1024,height:h||1024})});fill(await getState())}
+ui.apply.onclick=async()=>{let [w,h]=ui.resolution.value.split('x').map(Number);await fetch('/api/state',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:ui.prompt.value,seed:+ui.seed.value,strength:+ui.strength.value,steps:+ui.steps.value,blend:+ui.blend.value,left_right_flip:ui.left_right_flip.checked,passthrough:ui.passthrough.checked,use_latest_frame:ui.frame_mode.value==='latest',width:w||1024,height:h||1024})});fill(await getState())}
 setInterval(refresh,1000);
 getState().then(fill).catch(e=>{ui.status.textContent=`error: ${e.message}`});
 </script></body></html>)HTML";
@@ -1760,6 +1795,7 @@ std::string state_json() {
         << "\"blend\":" << g_state.blend << ","
         << "\"passthrough\":" << (g_state.passthrough ? "true" : "false") << ","
         << "\"use_latest_frame\":" << (g_state.use_latest_frame ? "true" : "false") << ","
+        << "\"left_right_flip\":" << (g_state.left_right_flip ? "true" : "false") << ","
         << "\"width\":" << g_state.width << ","
         << "\"height\":" << g_state.height << ","
         << "\"fps\":" << g_state.fps << ","
@@ -1776,7 +1812,8 @@ std::string state_json() {
         << "\"seed\":" << g_state.seed << ","
         << "\"strength\":" << g_state.strength << ","
         << "\"steps\":" << g_state.steps << ","
-        << "\"blend\":" << g_state.blend
+        << "\"blend\":" << g_state.blend << ","
+        << "\"left_right_flip\":" << (g_state.left_right_flip ? "true" : "false")
         << "},"
         << "\"config\":{"
         << "\"width\":" << g_state.width << ","
@@ -1897,6 +1934,8 @@ void apply_json_state(const std::string& body) {
         if (find_number(body, "blend", n)) g_state.blend = std::clamp(static_cast<float>(n), 0.0f, 1.0f);
         if (find_bool(body, "passthrough", b)) g_state.passthrough = b;
         if (find_bool(body, "use_latest_frame", b)) g_state.use_latest_frame = b;
+        if (find_bool(body, "left_right_flip", b)) g_state.left_right_flip = b;
+        if (find_bool(body, "mirror", b)) g_state.left_right_flip = b;
         if (find_string(body, "frame_mode", s)) g_state.use_latest_frame = (s != "fifo" && s != "no_drop");
         bool has_width = find_number(body, "width", n);
         int requested_width = has_width ? normalized_resolution(static_cast<int>(n)) : g_state.width;
@@ -2103,6 +2142,15 @@ void handle_osc(const char* data, size_t size) {
     auto name = address;
     const std::string prefix = "/transformirror";
     if (name.rfind(prefix, 0) == 0) name = name.substr(prefix.size());
+    auto read_osc_bool = [&](bool& value) -> bool {
+        if (types.find('T') != std::string::npos) { value = true; return true; }
+        if (types.find('F') != std::string::npos) { value = false; return true; }
+        if (pos + 4 <= size && (types.find('i') != std::string::npos || types.find('f') != std::string::npos)) {
+            value = read_be32(data + pos) != 0;
+            return true;
+        }
+        return false;
+    };
     if (name == "/prompt" && types.find('s') != std::string::npos && pos < size) {
         add_comma(); json << "\"prompt\":\"" << json_escape(std::string(data + pos)) << "\"";
     } else if (name == "/frame_mode" && types.find('s') != std::string::npos && pos < size) {
@@ -2115,10 +2163,13 @@ void handle_osc(const char* data, size_t size) {
         else json << "\"" << name.substr(1) << "\":" << value;
     } else if ((name == "/strength" || name == "/blend") && types.find('f') != std::string::npos && pos + 4 <= size) {
         add_comma(); json << "\"" << name.substr(1) << "\":" << read_befloat(data + pos);
-    } else if (name == "/passthrough" && pos + 4 <= size) {
-        add_comma(); json << "\"passthrough\":" << (read_be32(data + pos) ? "true" : "false");
-    } else if (name == "/use_latest_frame" && pos + 4 <= size) {
-        add_comma(); json << "\"use_latest_frame\":" << (read_be32(data + pos) ? "true" : "false");
+    } else if (name == "/passthrough" || name == "/use_latest_frame" || name == "/left_right_flip" || name == "/mirror") {
+        bool value = false;
+        if (read_osc_bool(value)) {
+            add_comma();
+            json << "\"" << (name == "/mirror" ? "left_right_flip" : name.substr(1)) << "\":"
+                 << (value ? "true" : "false");
+        }
     }
     json << "}";
     if (wrote) apply_json_state(json.str());
@@ -2407,6 +2458,7 @@ bool reexec_if_requested(const Args& args) {
     append_arg(argv, "--initial-blend", std::to_string(state.blend));
     append_arg(argv, "--initial-passthrough", state.passthrough ? "1" : "0");
     append_arg(argv, "--initial-use-latest-frame", state.use_latest_frame ? "1" : "0");
+    append_arg(argv, "--initial-left-right-flip", state.left_right_flip ? "1" : "0");
 
     std::vector<char*> exec_argv;
     exec_argv.reserve(argv.size() + 1);

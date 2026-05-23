@@ -118,6 +118,23 @@
       margin: 14px 0;
     }
 
+    .toggle {
+      align-items: center;
+      color: var(--text);
+      display: flex;
+      font-size: 14px;
+      gap: 10px;
+      margin: 14px 0;
+      text-transform: none;
+    }
+
+    .toggle input {
+      accent-color: var(--accent);
+      height: 18px;
+      margin: 0;
+      width: 18px;
+    }
+
     input[type="range"] {
       width: 100%;
       accent-color: var(--accent);
@@ -240,6 +257,11 @@
           <input id="blendNumber" type="number" min="0" max="1" step="0.01" title="OSC: /blend 0.5, or /passthrough true for raw input">
         </div>
 
+        <label class="toggle" for="leftRightFlip" title="OSC: /left_right_flip true">
+          <input id="leftRightFlip" type="checkbox" title="OSC: /left_right_flip true">
+          <span>Left-right flip</span>
+        </label>
+
         <div class="field">
           <label for="width" title="Changes build and switch to matching TensorRT engines automatically">Width</label>
           <input id="width" type="number" min="256" max="1280" step="32" title="Changes build and switch to matching TensorRT engines automatically">
@@ -347,6 +369,7 @@
         prompt: $("prompt").value,
         strength: Number($("strength").value),
         blend: Number($("blend").value),
+        left_right_flip: $("leftRightFlip").checked,
         width: Number($("width").value),
         height: Number($("height").value),
         seed: Number($("seed").value),
@@ -427,6 +450,7 @@
       }
       setPair("strength", "strengthNumber", controls.strength);
       setPair("blend", "blendNumber", controls.blend);
+      $("leftRightFlip").checked = Boolean(controls.left_right_flip ?? state.left_right_flip);
       const changingSize = state.status.resolution_changing;
       const visibleWidth = changingSize ? state.config.requested_width : state.config.width;
       const visibleHeight = changingSize ? state.config.requested_height : state.config.height;
@@ -471,6 +495,7 @@
     $("apply").addEventListener("click", () => apply());
     $("raw").addEventListener("click", () => apply({ blend: 0 }));
     $("processed").addEventListener("click", () => apply({ blend: 1 }));
+    $("leftRightFlip").addEventListener("change", () => apply({ left_right_flip: $("leftRightFlip").checked }));
     $("prompt").addEventListener("keydown", (event) => {
       if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
         event.preventDefault();

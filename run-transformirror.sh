@@ -54,11 +54,16 @@ defaults = {
     "strength": 0.7,
     "blend": 1.0,
     "steps": 2,
+    "left_right_flip": True,
     "http_port": 8080,
     "osc_port": 9000,
 }
-for key, value in defaults.items():
-    value = config.get(key, value)
+for key, default in defaults.items():
+    value = config.get(key, default)
+    if key == "left_right_flip":
+        value = config.get("left_right_flip", config.get("mirror", default))
+    if isinstance(value, bool):
+        value = int(value)
     var = "CFG_" + key.upper()
     print(f"{var}={shlex.quote(str(value))}")
 PY
@@ -108,4 +113,5 @@ exec "$APP_BINARY" \
   --initial-strength "$CFG_STRENGTH" \
   --initial-steps "$CFG_STEPS" \
   --initial-blend "$CFG_BLEND" \
+  --initial-left-right-flip "$CFG_LEFT_RIGHT_FLIP" \
   "$@"
