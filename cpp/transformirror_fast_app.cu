@@ -2671,6 +2671,14 @@ void asset_reload_thread(const Args& args, FastPipeline* pipeline) {
             g_state.status = std::string("conditioning worker launch failed: ") + e.what();
         }
     }
+    {
+        std::lock_guard<std::mutex> lock(g_state_mutex);
+        if (!g_state.reload_requested) {
+            g_state.reload_requested = true;
+            g_state.status = "syncing initial conditioning assets";
+        }
+    }
+    g_reload_cv.notify_one();
     while (g_running.load()) {
         bool reload = false;
         AppState snapshot;
