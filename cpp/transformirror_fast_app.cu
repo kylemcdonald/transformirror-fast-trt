@@ -2293,7 +2293,7 @@ float read_befloat(const char* p) {
     return f;
 }
 
-size_t osc_padded(size_t n) { return (n + 4) & ~size_t(3); }
+size_t osc_padded(size_t n) { return (n + 3) & ~size_t(3); }
 
 void handle_osc(const char* data, size_t size) {
     if (size < 8 || data[0] != '/') return;
