@@ -110,6 +110,7 @@ struct Args {
     std::string conditioning_script = "conditioning_worker.py";
     std::string conditioning_socket;
     std::string camera_device = "/dev/video0";
+    std::string settings_path;
     std::string capture_backend = "v4l2";
     std::string display_backend = "gl";
     std::string gl_sync = "vsync";
@@ -137,6 +138,11 @@ struct Args {
     bool has_initial_passthrough = false;
     bool has_initial_use_latest_frame = false;
     bool has_initial_left_right_flip = false;
+    bool has_initial_output_mode = false;
+    bool has_initial_output_x = false;
+    bool has_initial_output_y = false;
+    bool has_initial_output_width = false;
+    bool has_initial_output_height = false;
     std::string initial_prompt;
     int initial_seed = 0;
     float initial_strength = 0.7f;
@@ -145,6 +151,11 @@ struct Args {
     bool initial_passthrough = false;
     bool initial_use_latest_frame = true;
     bool initial_left_right_flip = true;
+    std::string initial_output_mode = "auto";
+    int initial_output_x = 0;
+    int initial_output_y = 0;
+    int initial_output_width = kWidth;
+    int initial_output_height = kHeight;
 };
 
 struct AppState {
@@ -156,6 +167,11 @@ struct AppState {
     bool passthrough = false;
     bool use_latest_frame = true;
     bool left_right_flip = true;
+    std::string output_mode = "auto";
+    int output_x = 0;
+    int output_y = 0;
+    int output_width = kWidth;
+    int output_height = kHeight;
     int width = kWidth;
     int height = kHeight;
     int http_port = 8080;
@@ -193,6 +209,8 @@ std::mutex g_reexec_mutex;
 std::string g_reexec_binary;
 std::string g_reexec_engine_dir;
 std::string g_reexec_asset_dir;
+std::mutex g_settings_mutex;
+std::string g_settings_path;
 
 std::string join_path(const std::string& a, const std::string& b) {
     if (a.empty() || a.back() == '/') return a + b;
@@ -346,6 +364,23 @@ int normalized_resolution(int value) {
     return std::clamp(rounded, 256, 1280);
 }
 
+int normalized_output_dimension(int value) {
+    return std::clamp(value, 1, 8192);
+}
+
+int normalized_output_dimension_or(int value, int fallback) {
+    return value > 0 ? normalized_output_dimension(value) : fallback;
+}
+
+std::string normalized_output_mode(const std::string& raw) {
+    std::string value = trim_copy(raw);
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    if (value == "manual" || value == "custom" || value == "rect" || value == "rectangle") return "manual";
+    return "auto";
+}
+
 void set_close_on_exec(int fd) {
     int flags = fcntl(fd, F_GETFD);
     if (flags >= 0) fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
@@ -419,6 +454,7 @@ Args parse_args(int argc, char** argv) {
         else if (key == "--conditioning-script") args.conditioning_script = val("--conditioning-script");
         else if (key == "--conditioning-socket") args.conditioning_socket = val("--conditioning-socket");
         else if (key == "--camera-device") args.camera_device = val("--camera-device");
+        else if (key == "--settings-path") args.settings_path = val("--settings-path");
         else if (key == "--capture-backend") args.capture_backend = val("--capture-backend");
         else if (key == "--display-backend") args.display_backend = val("--display-backend");
         else if (key == "--gl-sync") args.gl_sync = val("--gl-sync");
@@ -444,6 +480,11 @@ Args parse_args(int argc, char** argv) {
         else if (key == "--initial-passthrough") { args.initial_passthrough = parse_bool_arg(val("--initial-passthrough"), "--initial-passthrough"); args.has_initial_passthrough = true; }
         else if (key == "--initial-use-latest-frame") { args.initial_use_latest_frame = parse_bool_arg(val("--initial-use-latest-frame"), "--initial-use-latest-frame"); args.has_initial_use_latest_frame = true; }
         else if (key == "--initial-left-right-flip" || key == "--initial-mirror") { args.initial_left_right_flip = parse_bool_arg(val(key.c_str()), key.c_str()); args.has_initial_left_right_flip = true; }
+        else if (key == "--initial-output-mode") { args.initial_output_mode = normalized_output_mode(val("--initial-output-mode")); args.has_initial_output_mode = true; }
+        else if (key == "--initial-output-x") { args.initial_output_x = std::stoi(val("--initial-output-x")); args.has_initial_output_x = true; }
+        else if (key == "--initial-output-y") { args.initial_output_y = std::stoi(val("--initial-output-y")); args.has_initial_output_y = true; }
+        else if (key == "--initial-output-width") { args.initial_output_width = normalized_output_dimension_or(std::stoi(val("--initial-output-width")), kWidth); args.has_initial_output_width = true; }
+        else if (key == "--initial-output-height") { args.initial_output_height = normalized_output_dimension_or(std::stoi(val("--initial-output-height")), kHeight); args.has_initial_output_height = true; }
         else if (key == "--lock-memory") args.lock_memory = true;
         else if (key == "--realtime") {
             args.lock_memory = true;
@@ -461,6 +502,7 @@ Args parse_args(int argc, char** argv) {
                 << "       [--gl-sync off|vsync|strict] [--nvidia-full-composition auto|on|off]\n"
                 << "       [--http-port 8080] [--osc-port 9000] [--no-display]\n"
                 << "       [--initial-left-right-flip true|false]\n"
+                << "       [--initial-output-mode auto|manual] [--initial-output-x N]\n"
                 << "       [--realtime] [--lock-memory] [--rt-priority N]\n"
                 << "       [--main-core N] [--capture-core N] [--http-core N]\n";
             std::exit(0);
@@ -504,6 +546,11 @@ void apply_initial_state(const Args& args) {
     if (args.has_initial_passthrough) g_state.passthrough = args.initial_passthrough;
     if (args.has_initial_use_latest_frame) g_state.use_latest_frame = args.initial_use_latest_frame;
     if (args.has_initial_left_right_flip) g_state.left_right_flip = args.initial_left_right_flip;
+    if (args.has_initial_output_mode) g_state.output_mode = args.initial_output_mode;
+    if (args.has_initial_output_x) g_state.output_x = args.initial_output_x;
+    if (args.has_initial_output_y) g_state.output_y = args.initial_output_y;
+    if (args.has_initial_output_width) g_state.output_width = args.initial_output_width;
+    if (args.has_initial_output_height) g_state.output_height = args.initial_output_height;
 }
 
 std::vector<char> read_file(const std::string& path) {
@@ -780,6 +827,51 @@ void flip_rgb_horizontal(uint8_t* rgb) {
             std::swap(left[2], right[2]);
         }
     }
+}
+
+struct DisplayViewport {
+    int x = 0;
+    int y = 0;
+    int width = 1;
+    int height = 1;
+};
+
+DisplayViewport current_display_viewport(int window_width, int window_height) {
+    std::string mode = "auto";
+    int output_x = 0;
+    int output_y = 0;
+    int output_width = kWidth;
+    int output_height = kHeight;
+    {
+        std::lock_guard<std::mutex> lock(g_state_mutex);
+        mode = g_state.output_mode;
+        output_x = g_state.output_x;
+        output_y = g_state.output_y;
+        output_width = g_state.output_width;
+        output_height = g_state.output_height;
+    }
+
+    DisplayViewport viewport;
+    if (mode == "manual") {
+        viewport.x = output_x;
+        viewport.width = normalized_output_dimension(output_width);
+        viewport.height = normalized_output_dimension(output_height);
+        viewport.y = window_height - output_y - viewport.height;
+        return viewport;
+    }
+
+    viewport.width = window_width;
+    viewport.height = window_height;
+    const double target_aspect = static_cast<double>(kWidth) / static_cast<double>(kHeight);
+    const double window_aspect = static_cast<double>(window_width) / static_cast<double>(window_height);
+    if (window_aspect > target_aspect) {
+        viewport.width = std::max(1, static_cast<int>(std::lround(window_height * target_aspect)));
+        viewport.x = (window_width - viewport.width) / 2;
+    } else if (window_aspect < target_aspect) {
+        viewport.height = std::max(1, static_cast<int>(std::lround(window_width / target_aspect)));
+        viewport.y = (window_height - viewport.height) / 2;
+    }
+    return viewport;
 }
 
 class FastPipeline {
@@ -1135,23 +1227,11 @@ class GlDisplay {
         CHECK_CUDA(cudaMemcpy(mapped, device_rgb, rgb_bytes_, cudaMemcpyDeviceToDevice));
         CHECK_CUDA(cudaGraphicsUnmapResources(1, &cuda_resource_, 0));
 
-        int viewport_x = 0;
-        int viewport_y = 0;
-        int viewport_w = window_width_;
-        int viewport_h = window_height_;
-        const double target_aspect = static_cast<double>(kWidth) / static_cast<double>(kHeight);
-        const double window_aspect = static_cast<double>(window_width_) / static_cast<double>(window_height_);
-        if (window_aspect > target_aspect) {
-            viewport_w = std::max(1, static_cast<int>(std::lround(window_height_ * target_aspect)));
-            viewport_x = (window_width_ - viewport_w) / 2;
-        } else if (window_aspect < target_aspect) {
-            viewport_h = std::max(1, static_cast<int>(std::lround(window_width_ / target_aspect)));
-            viewport_y = (window_height_ - viewport_h) / 2;
-        }
+        DisplayViewport viewport = current_display_viewport(window_width_, window_height_);
 
         glViewport(0, 0, window_width_, window_height_);
         glClear(GL_COLOR_BUFFER_BIT);
-        glViewport(viewport_x, viewport_y, viewport_w, viewport_h);
+        glViewport(viewport.x, viewport.y, viewport.width, viewport.height);
         glBindTexture(GL_TEXTURE_2D, texture_);
         glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo_);
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, kWidth, kHeight, GL_RGB, GL_UNSIGNED_BYTE, nullptr);
@@ -1733,22 +1813,26 @@ input[type=range]{width:100%}textarea{width:100%;height:88px}button{cursor:point
 <label>Blend</label><div class="row"><input id="blend" type="range" min="0" max="1" step="0.01"><span id="blendv"></span></div>
 <label><input id="left_right_flip" type="checkbox"> Left-right flip</label>
 <label><input id="passthrough" type="checkbox"> Passthrough</label>
+<label>Output mode</label><select id="output_mode"><option value="auto">Auto fit centered</option><option value="manual">Manual rectangle</option></select>
+<label>Output rectangle</label><div class="row"><input id="output_width" type="number" min="1"><input id="output_height" type="number" min="1"></div>
+<div class="row"><input id="output_x" type="number"><input id="output_y" type="number"></div>
 <label>Frame handling</label><select id="frame_mode"><option value="latest">Always use newest frame</option><option value="fifo">Do not drop frames</option></select>
 <label>Resolution</label><input id="resolution" value="1024x1024">
 <p><button id="apply">Apply</button></p>
 <script>
 const ui={};
-for (const id of ['status','prompt','seed','strength','strengthv','steps','blend','blendv','left_right_flip','passthrough','frame_mode','resolution','apply']) ui[id]=document.getElementById(id);
+for (const id of ['status','prompt','seed','strength','strengthv','steps','blend','blendv','left_right_flip','passthrough','output_mode','output_x','output_y','output_width','output_height','frame_mode','resolution','apply']) ui[id]=document.getElementById(id);
 async function getState(){const r=await fetch('/api/state',{cache:'no-store'});if(!r.ok)throw new Error(`HTTP ${r.status}`);return await r.json()}
 function statusLine(s){return `${s.status_text || s.status?.message || 'running'} | ${s.fps.toFixed(1)} fps | model ${s.frame_ms.toFixed(2)} ms | capture ${s.capture_ms.toFixed(2)} ms | display ${s.display_ms.toFixed(2)} ms | loop ${s.loop_ms.toFixed(2)} ms | queued ${s.queued_frames} | dropped ${s.dropped_frames}`}
 function fill(s){ui.status.textContent=statusLine(s);
 ui.prompt.value=s.prompt;ui.seed.value=s.seed;ui.strength.value=s.strength;ui.strengthv.textContent=s.strength.toFixed(2);
 ui.steps.value=s.steps;ui.blend.value=s.blend;ui.blendv.textContent=s.blend.toFixed(2);ui.left_right_flip.checked=s.left_right_flip;ui.passthrough.checked=s.passthrough;
+ui.output_mode.value=s.output_mode;ui.output_x.value=s.output_x;ui.output_y.value=s.output_y;ui.output_width.value=s.output_width;ui.output_height.value=s.output_height;
 ui.frame_mode.value=s.use_latest_frame?'latest':'fifo';
 ui.resolution.value=`${s.width}x${s.height}`}
 async function refresh(){try{ui.status.textContent=statusLine(await getState())}catch(e){ui.status.textContent=`error: ${e.message}`}}
 for (const id of ['strength','blend']) ui[id].oninput=()=>ui[id+'v'].textContent=(+ui[id].value).toFixed(2);
-ui.apply.onclick=async()=>{let [w,h]=ui.resolution.value.split('x').map(Number);await fetch('/api/state',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:ui.prompt.value,seed:+ui.seed.value,strength:+ui.strength.value,steps:+ui.steps.value,blend:+ui.blend.value,left_right_flip:ui.left_right_flip.checked,passthrough:ui.passthrough.checked,use_latest_frame:ui.frame_mode.value==='latest',width:w||1024,height:h||1024})});fill(await getState())}
+ui.apply.onclick=async()=>{let [w,h]=ui.resolution.value.split('x').map(Number);await fetch('/api/state',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:ui.prompt.value,seed:+ui.seed.value,strength:+ui.strength.value,steps:+ui.steps.value,blend:+ui.blend.value,left_right_flip:ui.left_right_flip.checked,passthrough:ui.passthrough.checked,output_mode:ui.output_mode.value,output_x:+ui.output_x.value,output_y:+ui.output_y.value,output_width:+ui.output_width.value,output_height:+ui.output_height.value,use_latest_frame:ui.frame_mode.value==='latest',width:w||1024,height:h||1024})});fill(await getState())}
 setInterval(refresh,1000);
 getState().then(fill).catch(e=>{ui.status.textContent=`error: ${e.message}`});
 </script></body></html>)HTML";
@@ -1768,6 +1852,34 @@ std::string json_escape(const std::string& s) {
         else out += c;
     }
     return out;
+}
+
+void persist_output_settings(const AppState& state) {
+    if (g_settings_path.empty()) return;
+    std::lock_guard<std::mutex> lock(g_settings_mutex);
+    const std::string tmp_path = g_settings_path + ".tmp";
+    {
+        std::ofstream file(tmp_path, std::ios::trunc);
+        if (!file) {
+            std::cerr << "settings: failed to open " << tmp_path << " for writing\n";
+            return;
+        }
+        file << "{\n"
+             << "  \"output_mode\": \"" << json_escape(state.output_mode) << "\",\n"
+             << "  \"output_x\": " << state.output_x << ",\n"
+             << "  \"output_y\": " << state.output_y << ",\n"
+             << "  \"output_width\": " << state.output_width << ",\n"
+             << "  \"output_height\": " << state.output_height << "\n"
+             << "}\n";
+        if (!file) {
+            std::cerr << "settings: failed to write " << tmp_path << "\n";
+            return;
+        }
+    }
+    if (std::rename(tmp_path.c_str(), g_settings_path.c_str()) != 0) {
+        warn_errno("settings rename");
+        std::remove(tmp_path.c_str());
+    }
 }
 
 std::string state_json() {
@@ -1796,6 +1908,11 @@ std::string state_json() {
         << "\"passthrough\":" << (g_state.passthrough ? "true" : "false") << ","
         << "\"use_latest_frame\":" << (g_state.use_latest_frame ? "true" : "false") << ","
         << "\"left_right_flip\":" << (g_state.left_right_flip ? "true" : "false") << ","
+        << "\"output_mode\":\"" << json_escape(g_state.output_mode) << "\","
+        << "\"output_x\":" << g_state.output_x << ","
+        << "\"output_y\":" << g_state.output_y << ","
+        << "\"output_width\":" << g_state.output_width << ","
+        << "\"output_height\":" << g_state.output_height << ","
         << "\"width\":" << g_state.width << ","
         << "\"height\":" << g_state.height << ","
         << "\"fps\":" << g_state.fps << ","
@@ -1813,7 +1930,12 @@ std::string state_json() {
         << "\"strength\":" << g_state.strength << ","
         << "\"steps\":" << g_state.steps << ","
         << "\"blend\":" << g_state.blend << ","
-        << "\"left_right_flip\":" << (g_state.left_right_flip ? "true" : "false")
+        << "\"left_right_flip\":" << (g_state.left_right_flip ? "true" : "false") << ","
+        << "\"output_mode\":\"" << json_escape(g_state.output_mode) << "\","
+        << "\"output_x\":" << g_state.output_x << ","
+        << "\"output_y\":" << g_state.output_y << ","
+        << "\"output_width\":" << g_state.output_width << ","
+        << "\"output_height\":" << g_state.output_height
         << "},"
         << "\"config\":{"
         << "\"width\":" << g_state.width << ","
@@ -1822,6 +1944,11 @@ std::string state_json() {
         << "\"requested_height\":" << g_state.requested_height << ","
         << "\"cached_resolutions\":" << cached_resolutions << ","
         << "\"display_sync\":\"" << json_escape(g_state.display_sync) << "\","
+        << "\"output_mode\":\"" << json_escape(g_state.output_mode) << "\","
+        << "\"output_x\":" << g_state.output_x << ","
+        << "\"output_y\":" << g_state.output_y << ","
+        << "\"output_width\":" << g_state.output_width << ","
+        << "\"output_height\":" << g_state.output_height << ","
         << "\"http_port\":" << g_state.http_port << ","
         << "\"osc_port\":" << g_state.osc_port
         << "},"
@@ -1922,6 +2049,8 @@ void apply_json_state(const std::string& body) {
     double n;
     bool b;
     bool reload = false;
+    bool output_changed = false;
+    AppState output_snapshot;
     {
         std::lock_guard<std::mutex> lock(g_state_mutex);
         if (find_string(body, "prompt", s) && s != g_state.prompt) { g_state.prompt = s; reload = true; }
@@ -1936,6 +2065,42 @@ void apply_json_state(const std::string& body) {
         if (find_bool(body, "use_latest_frame", b)) g_state.use_latest_frame = b;
         if (find_bool(body, "left_right_flip", b)) g_state.left_right_flip = b;
         if (find_bool(body, "mirror", b)) g_state.left_right_flip = b;
+        if (find_string(body, "output_mode", s)) {
+            std::string mode = normalized_output_mode(s);
+            if (mode != g_state.output_mode) {
+                g_state.output_mode = mode;
+                output_changed = true;
+            }
+        }
+        if (find_bool(body, "output_manual", b)) {
+            std::string mode = b ? "manual" : "auto";
+            if (mode != g_state.output_mode) {
+                g_state.output_mode = mode;
+                output_changed = true;
+            }
+        }
+        if (find_number(body, "output_x", n) && static_cast<int>(n) != g_state.output_x) {
+            g_state.output_x = static_cast<int>(n);
+            output_changed = true;
+        }
+        if (find_number(body, "output_y", n) && static_cast<int>(n) != g_state.output_y) {
+            g_state.output_y = static_cast<int>(n);
+            output_changed = true;
+        }
+        if (find_number(body, "output_width", n)) {
+            int value = normalized_output_dimension(static_cast<int>(n));
+            if (value != g_state.output_width) {
+                g_state.output_width = value;
+                output_changed = true;
+            }
+        }
+        if (find_number(body, "output_height", n)) {
+            int value = normalized_output_dimension(static_cast<int>(n));
+            if (value != g_state.output_height) {
+                g_state.output_height = value;
+                output_changed = true;
+            }
+        }
         if (find_string(body, "frame_mode", s)) g_state.use_latest_frame = (s != "fifo" && s != "no_drop");
         bool has_width = find_number(body, "width", n);
         int requested_width = has_width ? normalized_resolution(static_cast<int>(n)) : g_state.width;
@@ -1959,7 +2124,9 @@ void apply_json_state(const std::string& body) {
             g_state.reload_requested = true;
             g_state.status = "conditioning reload queued";
         }
+        if (output_changed) output_snapshot = g_state;
     }
+    if (output_changed) persist_output_settings(output_snapshot);
     if (reload) g_reload_cv.notify_one();
     g_resolution_cv.notify_one();
 }
@@ -2153,9 +2320,11 @@ void handle_osc(const char* data, size_t size) {
     };
     if (name == "/prompt" && types.find('s') != std::string::npos && pos < size) {
         add_comma(); json << "\"prompt\":\"" << json_escape(std::string(data + pos)) << "\"";
-    } else if (name == "/frame_mode" && types.find('s') != std::string::npos && pos < size) {
-        add_comma(); json << "\"frame_mode\":\"" << json_escape(std::string(data + pos)) << "\"";
-    } else if ((name == "/seed" || name == "/steps" || name == "/width" || name == "/height") && types.find('i') != std::string::npos && pos + 4 <= size) {
+    } else if ((name == "/frame_mode" || name == "/output_mode") && types.find('s') != std::string::npos && pos < size) {
+        add_comma(); json << "\"" << name.substr(1) << "\":\"" << json_escape(std::string(data + pos)) << "\"";
+    } else if ((name == "/seed" || name == "/steps" || name == "/width" || name == "/height" ||
+                name == "/output_x" || name == "/output_y" || name == "/output_width" || name == "/output_height") &&
+               types.find('i') != std::string::npos && pos + 4 <= size) {
         int value = static_cast<int>(read_be32(data + pos));
         add_comma();
         if (name == "/width") json << "\"width\":" << value;
@@ -2163,7 +2332,8 @@ void handle_osc(const char* data, size_t size) {
         else json << "\"" << name.substr(1) << "\":" << value;
     } else if ((name == "/strength" || name == "/blend") && types.find('f') != std::string::npos && pos + 4 <= size) {
         add_comma(); json << "\"" << name.substr(1) << "\":" << read_befloat(data + pos);
-    } else if (name == "/passthrough" || name == "/use_latest_frame" || name == "/left_right_flip" || name == "/mirror") {
+    } else if (name == "/passthrough" || name == "/use_latest_frame" || name == "/left_right_flip" || name == "/mirror" ||
+               name == "/output_manual") {
         bool value = false;
         if (read_osc_bool(value)) {
             add_comma();
@@ -2433,6 +2603,7 @@ bool reexec_if_requested(const Args& args) {
     append_arg(argv, "--conditioning-script", args.conditioning_script);
     append_arg(argv, "--conditioning-socket", args.conditioning_socket);
     append_arg(argv, "--camera-device", args.camera_device);
+    if (!args.settings_path.empty()) append_arg(argv, "--settings-path", args.settings_path);
     append_arg(argv, "--capture-backend", args.capture_backend);
     append_arg(argv, "--display-backend", args.display_backend);
     append_arg(argv, "--gl-sync", args.gl_sync);
@@ -2459,6 +2630,11 @@ bool reexec_if_requested(const Args& args) {
     append_arg(argv, "--initial-passthrough", state.passthrough ? "1" : "0");
     append_arg(argv, "--initial-use-latest-frame", state.use_latest_frame ? "1" : "0");
     append_arg(argv, "--initial-left-right-flip", state.left_right_flip ? "1" : "0");
+    append_arg(argv, "--initial-output-mode", state.output_mode);
+    append_arg(argv, "--initial-output-x", std::to_string(state.output_x));
+    append_arg(argv, "--initial-output-y", std::to_string(state.output_y));
+    append_arg(argv, "--initial-output-width", std::to_string(state.output_width));
+    append_arg(argv, "--initial-output-height", std::to_string(state.output_height));
 
     std::vector<char*> exec_argv;
     exec_argv.reserve(argv.size() + 1);
@@ -2553,6 +2729,7 @@ int main(int argc, char** argv) {
     try {
         Args args = parse_args(argc, argv);
         apply_initial_state(args);
+        g_settings_path = args.settings_path;
         signal(SIGINT, on_signal);
         signal(SIGTERM, on_signal);
         configure_current_thread("main-frame", args.main_core, args.rt_priority);

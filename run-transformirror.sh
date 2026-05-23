@@ -30,18 +30,21 @@ xset dpms force on >/dev/null 2>&1 || true
 cd "$ROOT_DIR"
 
 CONFIG_PATH="${TRANSFORMIRROR_CONFIG:-$ROOT_DIR/live_config.json}"
+SETTINGS_PATH="${TRANSFORMIRROR_SETTINGS:-$ROOT_DIR/local_settings.json}"
 
-eval "$("$ROOT_DIR/.venv/bin/python" - "$CONFIG_PATH" <<'PY'
+eval "$("$ROOT_DIR/.venv/bin/python" - "$CONFIG_PATH" "$SETTINGS_PATH" <<'PY'
 import json
 import shlex
 import sys
 from pathlib import Path
 
 config_path = Path(sys.argv[1])
+settings_path = Path(sys.argv[2])
 config = {}
-if config_path.exists():
-    with config_path.open() as f:
-        config = json.load(f)
+for path in (config_path, settings_path):
+    if path.exists():
+        with path.open() as f:
+            config.update(json.load(f))
 
 defaults = {
     "width": 1280,
@@ -55,6 +58,11 @@ defaults = {
     "blend": 1.0,
     "steps": 2,
     "left_right_flip": True,
+    "output_mode": "auto",
+    "output_x": 0,
+    "output_y": 0,
+    "output_width": 0,
+    "output_height": 0,
     "http_port": 8080,
     "osc_port": 9000,
 }
@@ -99,6 +107,7 @@ exec "$APP_BINARY" \
   --web-root "$ROOT_DIR/web" \
   --conditioning-backend worker \
   --python "$ROOT_DIR/.venv/bin/python" \
+  --settings-path "$SETTINGS_PATH" \
   --camera-device "$CAMERA_DEVICE" \
   --capture-backend "$CFG_CAMERA_BACKEND" \
   --display-backend "${TRANSFORMIRROR_DISPLAY_BACKEND:-gl}" \
@@ -114,4 +123,9 @@ exec "$APP_BINARY" \
   --initial-steps "$CFG_STEPS" \
   --initial-blend "$CFG_BLEND" \
   --initial-left-right-flip "$CFG_LEFT_RIGHT_FLIP" \
+  --initial-output-mode "$CFG_OUTPUT_MODE" \
+  --initial-output-x "$CFG_OUTPUT_X" \
+  --initial-output-y "$CFG_OUTPUT_Y" \
+  --initial-output-width "$CFG_OUTPUT_WIDTH" \
+  --initial-output-height "$CFG_OUTPUT_HEIGHT" \
   "$@"

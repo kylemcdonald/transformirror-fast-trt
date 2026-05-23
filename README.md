@@ -231,7 +231,7 @@ Update:
 ```bash
 curl -X POST http://localhost:8080/api/state \
   -H 'Content-Type: application/json' \
-  -d '{"prompt":"a neon mirror portrait","seed":42,"strength":0.7,"steps":2,"blend":0.5,"left_right_flip":true,"use_latest_frame":true}'
+  -d '{"prompt":"a neon mirror portrait","seed":42,"strength":0.7,"steps":2,"blend":0.5,"left_right_flip":true,"output_mode":"auto","use_latest_frame":true}'
 ```
 
 Prompt, seed, strength, and steps trigger asynchronous conditioning regeneration.
@@ -239,7 +239,16 @@ With the default persistent worker, prompt changes are typically tens of
 milliseconds after the worker has warmed. `steps` accepts `2..8`; SDXL Turbo
 img2img may resolve that to fewer effective denoise passes depending on
 `strength`, and each extra effective pass adds another UNet call. Blend,
-passthrough, and left-right flip update immediately.
+passthrough, left-right flip, and output layout update immediately.
+
+The GL display output layout defaults to `output_mode:"auto"`, which fits the
+processed frame inside the fullscreen window without cropping and centers it.
+Set `output_mode:"manual"` plus `output_x`, `output_y`, `output_width`, and
+`output_height` to draw the output into a specific rectangle. `output_x` and
+`output_y` are measured from the fullscreen window's top-left corner.
+`run-transformirror.sh` also reads `local_settings.json` when present. That
+file is ignored by git and is intended for machine-specific layout settings that
+should persist across service restarts.
 
 Changing `width` or `height` queues a background build for a matching
 fixed-shape TensorRT app. The current app keeps running during the build, then
@@ -267,6 +276,12 @@ Supported addresses:
 /blend         float
 /passthrough   int/bool
 /left_right_flip int/bool
+/output_mode   string, "auto" or "manual"
+/output_x      int
+/output_y      int
+/output_width  int
+/output_height int
+/output_manual int/bool
 /use_latest_frame int/bool
 /frame_mode    string, "latest" or "fifo"
 /width         int

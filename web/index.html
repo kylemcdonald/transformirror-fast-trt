@@ -85,7 +85,8 @@
     }
 
     textarea,
-    input[type="number"] {
+    input[type="number"],
+    select {
       width: 100%;
       background: #0d1012;
       border: 1px solid var(--line);
@@ -102,7 +103,8 @@
     }
 
     textarea:focus,
-    input[type="number"]:focus {
+    input[type="number"]:focus,
+    select:focus {
       border-color: var(--accent);
     }
 
@@ -115,6 +117,13 @@
     }
 
     .field {
+      margin: 14px 0;
+    }
+
+    .output-grid {
+      display: grid;
+      gap: 12px;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
       margin: 14px 0;
     }
 
@@ -225,6 +234,7 @@
       #status { white-space: normal; }
       .layout { grid-template-columns: 1fr; }
       .row { grid-template-columns: 1fr 74px; }
+      .output-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     }
   </style>
 </head>
@@ -261,6 +271,33 @@
           <input id="leftRightFlip" type="checkbox" title="OSC: /left_right_flip true">
           <span>Left-right flip</span>
         </label>
+
+        <div class="field">
+          <label for="outputMode" title='OSC: /output_mode "manual"'>Output mode</label>
+          <select id="outputMode" title='OSC: /output_mode "manual"'>
+            <option value="auto">Auto fit centered</option>
+            <option value="manual">Manual rectangle</option>
+          </select>
+        </div>
+
+        <div class="output-grid">
+          <div>
+            <label for="outputX" title="OSC: /output_x 0">X</label>
+            <input id="outputX" type="number" step="1" title="OSC: /output_x 0">
+          </div>
+          <div>
+            <label for="outputY" title="OSC: /output_y 0">Y</label>
+            <input id="outputY" type="number" step="1" title="OSC: /output_y 0">
+          </div>
+          <div>
+            <label for="outputWidth" title="OSC: /output_width 1344">Width</label>
+            <input id="outputWidth" type="number" min="1" step="1" title="OSC: /output_width 1344">
+          </div>
+          <div>
+            <label for="outputHeight" title="OSC: /output_height 672">Height</label>
+            <input id="outputHeight" type="number" min="1" step="1" title="OSC: /output_height 672">
+          </div>
+        </div>
 
         <div class="field">
           <label for="width" title="Changes build and switch to matching TensorRT engines automatically">Width</label>
@@ -370,6 +407,11 @@
         strength: Number($("strength").value),
         blend: Number($("blend").value),
         left_right_flip: $("leftRightFlip").checked,
+        output_mode: $("outputMode").value,
+        output_x: Number($("outputX").value),
+        output_y: Number($("outputY").value),
+        output_width: Number($("outputWidth").value),
+        output_height: Number($("outputHeight").value),
         width: Number($("width").value),
         height: Number($("height").value),
         seed: Number($("seed").value),
@@ -451,6 +493,11 @@
       setPair("strength", "strengthNumber", controls.strength);
       setPair("blend", "blendNumber", controls.blend);
       $("leftRightFlip").checked = Boolean(controls.left_right_flip ?? state.left_right_flip);
+      if (!isFocused("outputMode")) $("outputMode").value = controls.output_mode || state.output_mode || "auto";
+      setValueIfIdle("outputX", controls.output_x ?? state.output_x);
+      setValueIfIdle("outputY", controls.output_y ?? state.output_y);
+      setValueIfIdle("outputWidth", controls.output_width ?? state.output_width);
+      setValueIfIdle("outputHeight", controls.output_height ?? state.output_height);
       const changingSize = state.status.resolution_changing;
       const visibleWidth = changingSize ? state.config.requested_width : state.config.width;
       const visibleHeight = changingSize ? state.config.requested_height : state.config.height;
@@ -496,6 +543,7 @@
     $("raw").addEventListener("click", () => apply({ blend: 0 }));
     $("processed").addEventListener("click", () => apply({ blend: 1 }));
     $("leftRightFlip").addEventListener("change", () => apply({ left_right_flip: $("leftRightFlip").checked }));
+    $("outputMode").addEventListener("change", () => apply({ output_mode: $("outputMode").value }));
     $("prompt").addEventListener("keydown", (event) => {
       if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
         event.preventDefault();
@@ -541,6 +589,15 @@
       width: Number($("width").value),
       height: Number($("height").value)
     }));
+    ["outputX", "outputY", "outputWidth", "outputHeight"].forEach((id) => {
+      $(id).addEventListener("change", () => apply({
+        output_mode: $("outputMode").value,
+        output_x: Number($("outputX").value),
+        output_y: Number($("outputY").value),
+        output_width: Number($("outputWidth").value),
+        output_height: Number($("outputHeight").value)
+      }));
+    });
 
     poll();
     setInterval(poll, 1000);

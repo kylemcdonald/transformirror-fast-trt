@@ -9,6 +9,8 @@ onnx_full/
 cpp_assets/
 trt_engines/
 outputs/
+local_settings.json
+local_settings.json.tmp
 *.plan
 *.onnx
 onnx__*
