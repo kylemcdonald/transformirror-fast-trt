@@ -66,6 +66,16 @@ PY
 
 WIDTH="${TRANSFORMIRROR_WIDTH:-$CFG_WIDTH}"
 HEIGHT="${TRANSFORMIRROR_HEIGHT:-$CFG_HEIGHT}"
+CAMERA_DEVICE="${TRANSFORMIRROR_CAMERA_DEVICE:-$CFG_CAMERA_DEVICE}"
+
+if [[ ! -e "$CAMERA_DEVICE" ]]; then
+  mapfile -t CAMERA_CANDIDATES < <(find /dev/v4l/by-id -maxdepth 1 -type l -name '*video-index0' 2>/dev/null | sort)
+  if [[ "${#CAMERA_CANDIDATES[@]}" -eq 1 ]]; then
+    echo "camera: configured device '$CAMERA_DEVICE' not found; using '${CAMERA_CANDIDATES[0]}'" >&2
+    CAMERA_DEVICE="${CAMERA_CANDIDATES[0]}"
+  fi
+fi
+
 ENGINE_DIR="$ROOT_DIR/trt_engines/${WIDTH}x${HEIGHT}"
 APP_BINARY="$ROOT_DIR/cpp/build_${WIDTH}x${HEIGHT}/transformirror_fast_app"
 
@@ -84,7 +94,7 @@ exec "$APP_BINARY" \
   --web-root "$ROOT_DIR/web" \
   --conditioning-backend worker \
   --python "$ROOT_DIR/.venv/bin/python" \
-  --camera-device "$CFG_CAMERA_DEVICE" \
+  --camera-device "$CAMERA_DEVICE" \
   --capture-backend "$CFG_CAMERA_BACKEND" \
   --display-backend "${TRANSFORMIRROR_DISPLAY_BACKEND:-gl}" \
   --gl-sync "${TRANSFORMIRROR_GL_SYNC:-vsync}" \
