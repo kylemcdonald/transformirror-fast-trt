@@ -183,6 +183,41 @@ HTTP and OSC bind to all IPv4 and IPv6 interfaces. On Linux with Avahi/mDNS
 enabled, the same HTTP UI and OSC UDP port are reachable at
 `<hostname>.local`.
 
+## Startup Service
+
+Install the systemd user service from this checkout:
+
+```bash
+./scripts/install_systemd_user_service.sh
+```
+
+The installer removes older Transformirror service names first, including
+`transformirror.service`, `transformirror-local.service`, and any existing
+`transformirror-fast-trt.service`. It then installs a fresh user service named
+`transformirror-fast-trt.service` that runs this repo's `run-transformirror.sh`.
+Run the installer as the desktop user, not with `sudo`.
+
+The installer also enables linger when system policy allows it, so the user
+service can start at boot instead of waiting for an interactive login:
+
+```bash
+loginctl show-user "$USER" -p Linger
+```
+
+Manage the service:
+
+```bash
+systemctl --user status transformirror-fast-trt.service --no-pager
+journalctl --user -u transformirror-fast-trt.service -f
+systemctl --user restart transformirror-fast-trt.service
+```
+
+Remove all installed Transformirror systemd units:
+
+```bash
+./scripts/uninstall_systemd_services.sh
+```
+
 ## HTTP API
 
 State:
@@ -326,5 +361,7 @@ References:
 * `export_onnx_components.py` - ONNX export for VAE/UNet
 * `export_cpp_assets.py` - prompt/noise/scheduler asset export
 * `scripts/build_default_engines.sh` - default 1024x1024 build
+* `scripts/install_systemd_user_service.sh` - install the startup user service
+* `scripts/uninstall_systemd_services.sh` - remove Transformirror systemd units
 * `scripts/install_display_deps.sh` - Ubuntu display backend dependencies
 * `scripts/lock_gpu_clocks.sh` - optional NVIDIA clock lock/reset helper
